@@ -137,7 +137,7 @@ def tech(x):
     return s,n
 
 def analyze(pair,threshold):
-   fs={tf:add(candles(pair,tf)) for tf in ["15min","1h","4h"]};w={"15min":1,"1h":2,"4h":3};detail=[];parts=[]
+    fs={tf:add(candles(pair.replace("/",""),tf)) for tf in ["15min","1h","4h"]};w={"15min":1,"1h":2,"4h":3};detail=[];parts=[]
     for tf in w:
         s,n=tech(fs[tf]);parts.append(s*w[tf]);detail.append(f"{tf}: {', '.join(n)}")
     technical=sum(parts)/6;t,b,_,_=structure(fs["1h"]);stc=10 if t=="BULLISH" else -10 if t=="BEARISH" else 0;stc+=8 if b=="Bullish BOS" else -8 if b=="Bearish BOS" else 0
