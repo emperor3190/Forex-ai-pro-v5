@@ -434,7 +434,14 @@ if mode=="Forex":
     except Exception as e: st.error(f"Forex analysis failed: {e}"); st.stop()
     live[3].metric("Signal",result["signal"]); live[4].metric("Confidence",f'{result["confidence"]}/100')
     st.subheader("🎯 Final Forex Decision")
-    st.success("🟢 BUY") if result["signal"]=="BUY" else st.error("🔴 SELL") if result["signal"]=="SELL" else st.warning("🟡 NO TRADE")
+    st.subheader("🎯 Final Forex Decision")
+
+if result["signal"] == "BUY":
+    st.success("🟢 BUY")
+elif result["signal"] == "SELL":
+    st.error("🔴 SELL")
+else:
+    st.warning("🟡 NO TRADE")
     c=st.columns(6)
     for col,(label,val) in zip(c,[("Overall score",result["total"]),("Technical",result["technical"]),("Structure",result["structure_score"]),("Momentum",result["momentum"]),("Liquidity",result["liquidity"][3]),("Event risk",result["event_score"])]): col.metric(label,f"{val:.1f}")
     st.subheader("🕒 Multi-Timeframe Bias")
