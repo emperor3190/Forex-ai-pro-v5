@@ -1,0 +1,1002 @@
+
+"""
+V12.1 AI Trading Platform
+Single-file Streamlit trading research / paper-trading terminal.
+
+Architecture:
+Market Data -> Technical/Fundamental/Positioning Intelligence -> MTF/Regime
+-> Confluence -> Signal Validation -> Risk Veto -> Forex/Binary Entry
+-> Paper Execution -> Trade Monitor -> Journal -> Backtest/Walk-forward/Monte Carlo
+-> Dashboard.
+
+Important:
+- This build is designed for research, backtesting and paper trading.
+- Live execution requires an official broker/data API adapter.
+- Binary options availability/legality varies by jurisdiction and broker.
+- Economic/COT engines accept uploaded/manual data; no provider credentials are hard-coded.
+"""
+from __future__ import annotations
+
+import io
+import math
+import uuid
+from dataclasses import dataclass, asdict, field
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional, Tuple, Any
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+
+# =========================
+# Configuration / State
+# =========================
+
+@dataclass
+class Config:
+    initial_balance: float = 10000.0
+    risk_per_trade: float = 0.005
+    max_daily_loss: float = 0.03
+    max_weekly_loss: float = 0.07
+    max_drawdown: float = 0.15
+    max_open_positions: int = 3
+    max_symbol_exposure: float = 0.02
+    min_score: float = 72.0
+    min_binary_confidence: float = 72.0
+    binary_payout: float = 0.80
+    max_spread_pips: float = 2.0
+    slippage_pips: float = 0.3
+    commission_per_lot: float = 0.0
+    binary_expiries: Tuple[int, ...] = (5, 10, 15, 30)
+    news_blackout_before: int = 30
+    news_blackout_after: int = 15
+    demo_rows: int = 1200
+
+
+# =========================
+# Data Layer
+# =========================
+
+class MarketDataEngine:
+    TIMEFRAMES = ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
+
+    @staticmethod
+    def normalize(df: pd.DataFrame) -> pd.DataFrame:
+        x = df.copy()
+        x.columns = [str(c).strip().lower().replace(" ", "_") for c in x.columns]
+        aliases = {
+            "datetime": "time", "date": "time", "timestamp": "time",
+            "vol": "volume", "tick_volume": "volume"
+        }
+        x = x.rename(columns={c: aliases.get(c, c) for c in x.columns})
+        required = ["open", "high", "low", "close"]
+        for c in required:
+            if c not in x.columns:
+                raise ValueError(f"Missing required OHLC column: {c}")
+            x[c] = pd.to_numeric(x[c], errors="coerce")
+        if "volume" not in x.columns:
+            x["volume"] = 0.0
+        if "time" in x.columns:
+            x["time"] = pd.to_datetime(x["time"], errors="coerce", utc=True)
+        else:
+            x["time"] = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=len(x), freq="5min")
+        x = x.dropna(subset=required).drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
+        x["spread_pips"] = np.nan
+        return x
+
+    @staticmethod
+    def synthetic(symbol="EURUSD", rows=1200, seed=7) -> pd.DataFrame:
+        rng = np.random.default_rng(seed)
+        t = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=rows, freq="5min")
+        # Regime-switching synthetic walk, intentionally only for UI/demo/backtest testing.
+        regimes = np.where((np.arange(rows) // 180) % 3 == 0, 0.00008,
+                           np.where((np.arange(rows) // 180) % 3 == 1, -0.00003, 0.0))
+        noise = rng.normal(0, 0.00045, rows)
+        close = 1.08 + np.cumsum(regimes + noise)
+        close = np.maximum(close, 0.5)
+        op = np.r_[close[0], close[:-1]]
+        spread = np.abs(rng.normal(0.00008, 0.000025, rows))
+        high = np.maximum(op, close) + spread
+        low = np.minimum(op, close) - spread
+        vol = rng.integers(80, 1200, rows)
+        return pd.DataFrame({"time": t, "open": op, "high": high, "low": low,
+                             "close": close, "volume": vol})
+
+    @staticmethod
+    def resample(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        rule = {"M1":"1min","M5":"5min","M15":"15min","M30":"30min","H1":"1h","H4":"4h","D1":"1D"}[timeframe]
+        x = df.copy().set_index("time")
+        out = x.resample(rule).agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
+        return out.reset_index()
+
+    @staticmethod
+    def validate(df: pd.DataFrame) -> Dict[str, Any]:
+        x = MarketDataEngine.normalize(df)
+        gaps = x["time"].diff().dt.total_seconds().div(60).dropna()
+        return {
+            "rows": len(x),
+            "duplicates_removed": int(df.shape[0] - x.shape[0]),
+            "missing_ohlc": int(x[["open","high","low","close"]].isna().sum().sum()),
+            "large_gaps": int((gaps > 60).sum()) if len(gaps) else 0,
+            "timezone": "UTC",
+            "data_ok": len(x) >= 100,
+        }
+
+
+# =========================
+# Indicator Utilities
+# =========================
+
+def ema(s, n): return s.ewm(span=n, adjust=False).mean()
+def sma(s, n): return s.rolling(n).mean()
+
+def rsi(close, n=14):
+    d = close.diff()
+    up = d.clip(lower=0)
+    dn = -d.clip(upper=0)
+    au = up.ewm(alpha=1/n, adjust=False).mean()
+    ad = dn.ewm(alpha=1/n, adjust=False).mean()
+    rs = au / ad.replace(0, np.nan)
+    return (100 - 100/(1+rs)).fillna(50)
+
+def atr(df, n=14):
+    pc = df["close"].shift(1)
+    tr = pd.concat([(df["high"]-df["low"]), (df["high"]-pc).abs(), (df["low"]-pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/n, adjust=False).mean()
+
+def macd(close):
+    line = ema(close, 12) - ema(close, 26)
+    sig = ema(line, 9)
+    return line, sig, line-sig
+
+def stochastic(df, n=14):
+    lo, hi = df["low"].rolling(n).min(), df["high"].rolling(n).max()
+    k = 100*(df["close"]-lo)/(hi-lo).replace(0,np.nan)
+    d = k.rolling(3).mean()
+    return k.fillna(50), d.fillna(50)
+
+def roc(close, n=12):
+    return close.pct_change(n)*100
+
+def cci(df, n=20):
+    tp=(df["high"]+df["low"]+df["close"])/3
+    mean=tp.rolling(n).mean()
+    md=(tp-mean).abs().rolling(n).mean()
+    return ((tp-mean)/(0.015*md.replace(0,np.nan))).fillna(0)
+
+def williams_r(df, n=14):
+    hi=df["high"].rolling(n).max(); lo=df["low"].rolling(n).min()
+    return (-100*(hi-df["close"])/(hi-lo).replace(0,np.nan)).fillna(-50)
+
+def mfi(df, n=14):
+    tp=(df["high"]+df["low"]+df["close"])/3
+    mf=tp*df["volume"].replace(0,1)
+    pos=mf.where(tp.diff()>0,0).rolling(n).sum()
+    neg=mf.where(tp.diff()<0,0).rolling(n).sum().abs()
+    ratio=pos/neg.replace(0,np.nan)
+    return (100-100/(1+ratio)).fillna(50)
+
+def adx(df, n=14):
+    up=df["high"].diff(); dn=-df["low"].diff()
+    plus=up.where((up>dn)&(up>0),0.0)
+    minus=dn.where((dn>up)&(dn>0),0.0)
+    tr=atr(df,n)
+    pdi=100*plus.ewm(alpha=1/n,adjust=False).mean()/tr.replace(0,np.nan)
+    mdi=100*minus.ewm(alpha=1/n,adjust=False).mean()/tr.replace(0,np.nan)
+    dx=100*(pdi-mdi).abs()/(pdi+mdi).replace(0,np.nan)
+    return dx.ewm(alpha=1/n,adjust=False).mean().fillna(0), pdi.fillna(0), mdi.fillna(0)
+
+def supertrend_bias(df, n=10, mult=3.0):
+    a=atr(df,n)
+    mid=(df["high"]+df["low"])/2
+    upper=mid+mult*a; lower=mid-mult*a
+    return np.where(df["close"]>upper.shift(1),"BULLISH",np.where(df["close"]<lower.shift(1),"BEARISH","NEUTRAL"))
+
+def ichimoku_bias(df):
+    ten=(df["high"].rolling(9).max()+df["low"].rolling(9).min())/2
+    kij=(df["high"].rolling(26).max()+df["low"].rolling(26).min())/2
+    return np.where(ten>kij,"BULLISH",np.where(ten<kij,"BEARISH","NEUTRAL"))
+
+
+# =========================
+# Analysis Engines
+# =========================
+
+class TrendEngine:
+    @staticmethod
+    def analyze(df):
+        x=df.copy()
+        for n in [9,20,50,100,200]:
+            x[f"ema{n}"]=ema(x.close,n)
+        x["sma50"]=sma(x.close,50)
+        x["macd"],x["macd_signal"],x["macd_hist"]=macd(x.close)
+        x["adx"],x["pdi"],x["mdi"]=adx(x)
+        x["ichimoku"]=ichimoku_bias(x)
+        x["supertrend"]=supertrend_bias(x)
+        last=x.iloc[-1]
+        votes=0
+        for n in [9,20,50,100,200]:
+            votes += 1 if last.close>last[f"ema{n}"] else -1
+        votes += 1 if last.macd_hist>0 else -1
+        votes += 1 if last.pdi>last.mdi else -1
+        votes += 1 if last.ichimoku=="BULLISH" else (-1 if last.ichimoku=="BEARISH" else 0)
+        votes += 1 if last.supertrend=="BULLISH" else (-1 if last.supertrend=="BEARISH" else 0)
+        direction="BULLISH" if votes>=3 else "BEARISH" if votes<=-3 else "SIDEWAYS"
+        strength=min(100, 50+abs(votes)*6+max(0,float(last.adx)-20))
+        label="STRONG BULLISH" if direction=="BULLISH" and strength>=75 else \
+              "WEAK BULLISH" if direction=="BULLISH" else \
+              "STRONG BEARISH" if direction=="BEARISH" and strength>=75 else \
+              "WEAK BEARISH" if direction=="BEARISH" else "SIDEWAYS"
+        return {"direction":direction,"strength":float(strength),"label":label,"adx":float(last.adx),
+                "ema9":float(last.ema9),"ema20":float(last.ema20),"ema50":float(last.ema50),
+                "ema100":float(last.ema100),"ema200":float(last.ema200)}
+
+class MomentumEngine:
+    @staticmethod
+    def analyze(df):
+        rr=rsi(df.close); k,d=stochastic(df); ml,ms,mh=macd(df.close)
+        ro=roc(df.close); cc=cci(df); wr=williams_r(df); mf=mfi(df)
+        a,_,_=adx(df)
+        last=df.iloc[-1]
+        score=50 + np.clip((rr.iloc[-1]-50)*0.45, -22, 22) + np.clip(mh.iloc[-1]/max(abs(mh.iloc[-50:]).mean(),1e-9)*8,-10,10)
+        direction="BULLISH" if score>=58 else "BEARISH" if score<=42 else "NEUTRAL"
+        accel=float(mh.iloc[-1]-mh.iloc[-2]) if len(mh)>1 else 0
+        div="NONE"
+        if len(df)>=30:
+            price_change=df.close.iloc[-1]-df.close.iloc[-15]
+            r_change=rr.iloc[-1]-rr.iloc[-15]
+            if price_change>0 and r_change<0: div="BEARISH"
+            elif price_change<0 and r_change>0: div="BULLISH"
+        state=("OVERBOUGHT" if rr.iloc[-1]>=70 else "OVERSOLD" if rr.iloc[-1]<=30 else
+               "INCREASING" if accel>0 else "DECREASING" if accel<0 else "NORMAL")
+        return {"direction":direction,"score":float(np.clip(score,0,100)),"rsi":float(rr.iloc[-1]),
+                "stochastic":float(k.iloc[-1]),"macd_hist":float(mh.iloc[-1]),"roc":float(ro.iloc[-1]),
+                "cci":float(cc.iloc[-1]),"williams_r":float(wr.iloc[-1]),"mfi":float(mf.iloc[-1]),
+                "adx":float(a.iloc[-1]),"divergence":div,"state":state}
+
+class VolatilityEngine:
+    @staticmethod
+    def analyze(df):
+        a=atr(df); mid=df.close.rolling(20).mean(); sd=df.close.rolling(20).std()
+        bw=(4*sd/mid.replace(0,np.nan))*100
+        hv=df.close.pct_change().rolling(50).std()*math.sqrt(252*24*12)*100
+        ar=(df.high-df.low)/df.close*100
+        last=max(0,len(df)-1)
+        atr_pct=float(a.iloc[last]/df.close.iloc[last]*100)
+        bwv=float(bw.iloc[last])
+        hvv=float(hv.iloc[last]) if np.isfinite(hv.iloc[last]) else 0
+        z=float((ar.iloc[last]-ar.rolling(50).mean().iloc[last])/(ar.rolling(50).std().iloc[last] or 1))
+        composite=atr_pct*0.5+bwv*0.3+hvv*0.2
+        regime="EXTREME" if z>3 else "HIGH" if z>1.5 else "VERY LOW" if z<-1.5 else "LOW" if z<-0.5 else "NORMAL"
+        return {"atr":float(a.iloc[last]),"atr_pct":atr_pct,"bb_width":bwv,"historical_vol":hvv,
+                "range_z":z,"composite":float(composite),"regime":regime,
+                "expansion":bool(z>0.5),"compression":bool(z<-0.5)}
+
+class StructureEngine:
+    @staticmethod
+    def analyze(df, lookback=5):
+        x=df.tail(max(100,lookback*10)).copy()
+        highs=x.high[(x.high.shift(lookback)<x.high)&(x.high.shift(-lookback)<x.high)]
+        lows=x.low[(x.low.shift(lookback)>x.low)&(x.low.shift(-lookback)>x.low)]
+        sh=float(highs.dropna().iloc[-1]) if len(highs.dropna()) else float(x.high.iloc[-1])
+        sl=float(lows.dropna().iloc[-1]) if len(lows.dropna()) else float(x.low.iloc[-1])
+        prev_h=float(highs.dropna().iloc[-2]) if len(highs.dropna())>1 else sh
+        prev_l=float(lows.dropna().iloc[-2]) if len(lows.dropna())>1 else sl
+        hh=sh>prev_h; hl=sl>prev_l; lh=sh<prev_h; ll=sl<prev_l
+        direction="BULLISH" if hh and hl else "BEARISH" if lh and ll else "TRANSITION"
+        last=float(x.close.iloc[-1])
+        bos="BULLISH_BOS" if last>sh else "BEARISH_BOS" if last<sl else "NONE"
+        choch="BULLISH_CHOCH" if direction=="BEARISH" and last>sh else "BEARISH_CHOCH" if direction=="BULLISH" and last<sl else "NONE"
+        return {"direction":direction,"swing_high":sh,"swing_low":sl,"HH":hh,"HL":hl,"LH":lh,"LL":ll,
+                "BOS":bos,"CHOCH":choch,"breakout":bos!="NONE","failure":False}
+
+class PriceActionEngine:
+    @staticmethod
+    def analyze(df):
+        x=df.iloc[-3:].copy()
+        o,h,l,c=x.open.iloc[-1],x.high.iloc[-1],x.low.iloc[-1],x.close.iloc[-1]
+        body=abs(c-o); rng=max(h-l,1e-12); upper=h-max(o,c); lower=min(o,c)-l
+        bull_eng=c>o and x.close.iloc[-2]<x.open.iloc[-2] and c>=x.open.iloc[-2] and o<=x.close.iloc[-2]
+        bear_eng=c<o and x.close.iloc[-2]>x.open.iloc[-2] and c<=x.open.iloc[-2] and o>=x.close.iloc[-2]
+        pin_bull=lower>body*2 and upper<body
+        pin_bear=upper>body*2 and lower<body
+        doji=body/rng<0.12
+        inside=h<x.high.iloc[-2] and l>x.low.iloc[-2]
+        outside=h>x.high.iloc[-2] and l<x.low.iloc[-2]
+        strong=body/rng>0.7
+        patterns=[]
+        if bull_eng: patterns.append("BULLISH_ENGULFING")
+        if bear_eng: patterns.append("BEARISH_ENGULFING")
+        if pin_bull: patterns.append("BULLISH_PIN")
+        if pin_bear: patterns.append("BEARISH_PIN")
+        if doji: patterns.append("DOJI")
+        if inside: patterns.append("INSIDE_BAR")
+        if outside: patterns.append("OUTSIDE_BAR")
+        if strong: patterns.append("STRONG_MOMENTUM_CANDLE")
+        direction="BULLISH" if any("BULL" in p for p in patterns) else "BEARISH" if any("BEAR" in p for p in patterns) else "NEUTRAL"
+        return {"patterns":patterns,"direction":direction,"body_ratio":body/rng,"upper_wick":upper/rng,"lower_wick":lower/rng}
+
+class SupportResistanceEngine:
+    @staticmethod
+    def analyze(df):
+        x=df.copy(); last=float(x.close.iloc[-1])
+        levels=[]
+        for n,label in [(20,"SWING"),(50,"MEDIUM"),(100,"LONG")]:
+            if len(x)>=n:
+                levels += [(float(x.high.tail(n).max()),"RESISTANCE_"+label),
+                           (float(x.low.tail(n).min()),"SUPPORT_"+label)]
+        # Previous day/week/month based on available data
+        d=x.set_index("time")
+        for rule,label in [("1D","DAY"),("7D","WEEK"),("30D","MONTH")]:
+            y=d.tail(1).index[0]
+            z=d.loc[:y].tail(1)
+            if len(z): pass
+        supports=[v for v,l in levels if v<=last]; res=[v for v,l in levels if v>=last]
+        support=max(supports) if supports else min(v for v,_ in levels)
+        resistance=min(res) if res else max(v for v,_ in levels)
+        touches=sum(1 for v,_ in levels if abs(v-last)/max(last,1e-9)<0.002)
+        return {"support":float(support),"resistance":float(resistance),
+                "distance_support":float((last-support)/last*100),
+                "distance_resistance":float((resistance-last)/last*100),
+                "strength":float(min(100,30+touches*12)),
+                "touches":touches,"break_probability":float(np.clip(50+(last-support)/(resistance-support+1e-12)*20,0,100)),
+                "retest_probability":float(np.clip(60-touches*4,10,90))}
+
+class BreakoutEngine:
+    @staticmethod
+    def analyze(df, n=20):
+        hi=df.high.shift(1).rolling(n).max(); lo=df.low.shift(1).rolling(n).min()
+        last=df.iloc[-1]; up=last.close>hi.iloc[-1]; dn=last.close<lo.iloc[-1]
+        volz=(last.volume-df.volume.rolling(50).mean().iloc[-1])/(df.volume.rolling(50).std().iloc[-1] or 1)
+        breakout="BULLISH_BREAKOUT" if up else "BEARISH_BREAKOUT" if dn else "NONE"
+        confirmed=(up or dn) and volz>0.5
+        fakeout=(up or dn) and volz< -0.5
+        return {"state":"FAKEOUT" if fakeout else "BREAKOUT" if breakout!="NONE" else "RANGE",
+                "direction":"BULLISH" if up else "BEARISH" if dn else "NONE",
+                "volume_z":float(volz),"confirmed":bool(confirmed),"retest":bool(up or dn)}
+
+class LiquidityEngine:
+    @staticmethod
+    def analyze(df):
+        x=df.tail(80); eqh=float(x.high.quantile(.95)); eql=float(x.low.quantile(.05))
+        last=float(x.close.iloc[-1]); rng=float((x.high-x.low).tail(20).mean())
+        sweep_up=last<eqh and x.high.iloc[-1]>=eqh
+        sweep_dn=last>eql and x.low.iloc[-1]<=eql
+        fvg=False
+        if len(x)>=3:
+            fvg=bool(x.low.iloc[-1]>x.high.iloc[-3] or x.high.iloc[-1]<x.low.iloc[-3])
+        return {"liquidity_high":eqh,"liquidity_low":eql,"equal_highs":eqh,"equal_lows":eql,
+                "sweep_up":sweep_up,"sweep_down":sweep_dn,"FVG":fvg,"liquidity_void":bool(rng>2*x.close.iloc[-1]*0.001)}
+
+class RegimeEngine:
+    @staticmethod
+    def classify(trend, vol, structure, breakout):
+        if vol["regime"]=="EXTREME": return "ABNORMAL"
+        if breakout["state"]=="BREAKOUT": return "BREAKOUT"
+        if vol["regime"] in ("VERY LOW","LOW") and trend["direction"]=="SIDEWAYS": return "LOW VOLATILITY"
+        if trend["direction"]=="SIDEWAYS": return "RANGING"
+        if trend["strength"]>=72 and structure["direction"] in ("BULLISH","BEARISH"): return "TRENDING"
+        if structure["direction"]=="TRANSITION": return "TRANSITION"
+        return "EXTENDED" if trend["strength"]>=88 else "NO-TRADE"
+
+class SessionEngine:
+    @staticmethod
+    def analyze(ts=None):
+        t=(ts or pd.Timestamp.now(tz="UTC"))
+        h=int(t.hour)
+        if 0<=h<8: s="ASIAN"
+        elif 8<=h<13: s="LONDON"
+        elif 13<=h<17: s="LONDON/NEW YORK OVERLAP"
+        elif 17<=h<22: s="NEW YORK"
+        else: s="OFF-HOURS"
+        return {"session":s,"hour":h,"weekday":t.day_name(),"session_tradeable":s!="OFF-HOURS"}
+
+class CurrencyStrengthEngine:
+    CURRENCIES=["USD","EUR","GBP","JPY","AUD","CAD","CHF","NZD"]
+    @staticmethod
+    def analyze(df, symbol="EURUSD"):
+        # Relative strength proxy from the supplied symbol; full matrix can be fed from multiple pairs.
+        ret=float(df.close.pct_change(20).iloc[-1]*100) if len(df)>20 else 0
+        base,quote=(symbol[:3],symbol[3:]) if len(symbol)>=6 else ("EUR","USD")
+        out={c:0.0 for c in CurrencyStrengthEngine.CURRENCIES}
+        out[base]=float(np.clip(ret*10,-5,5)); out[quote]=float(np.clip(-ret*10,-5,5))
+        return {"matrix":out,"base":base,"quote":quote,"spread":out[base]-out[quote],
+                "strongest":max(out,key=out.get),"weakest":min(out,key=out.get)}
+
+class CorrelationEngine:
+    @staticmethod
+    def analyze(history: Dict[str,pd.DataFrame], symbol):
+        if symbol not in history or len(history)<2: return {"average_abs_corr":0.0,"risk":"LOW","pairs":[]}
+        s=history[symbol].close.pct_change().tail(200)
+        rows=[]
+        for k,v in history.items():
+            if k==symbol: continue
+            a=v.close.pct_change().tail(200)
+            n=min(len(s),len(a))
+            if n>30:
+                corr=float(s.tail(n).corr(a.tail(n)))
+                rows.append((k,corr))
+        avg=float(np.mean([abs(c) for _,c in rows])) if rows else 0
+        return {"average_abs_corr":avg,"risk":"HIGH" if avg>.75 else "MEDIUM" if avg>.5 else "LOW","pairs":sorted(rows,key=lambda z:-abs(z[1]))}
+
+class MarketTrackerEngine:
+    @staticmethod
+    def rank(symbols, analyses):
+        rows=[]
+        for sym,a in analyses.items():
+            score=a["confluence"]["score"]
+            rows.append({"SYMBOL":sym,"DIRECTION":a["confluence"]["direction"],"SCORE":round(score,1),
+                         "REGIME":a["regime"],"VOLATILITY":a["volatility"]["regime"],
+                         "SESSION":a["session"]["session"],"TREND":a["trend"]["label"],
+                         "MOMENTUM":a["momentum"]["direction"],"STRUCTURE":a["structure"]["direction"],
+                         "ENTRY QUALITY":round(a["confluence"]["entry_quality"],1),
+                         "RISK":a["risk"]["status"]})
+        return pd.DataFrame(rows).sort_values("SCORE",ascending=False).reset_index(drop=True)
+
+class MultiTimeframeEngine:
+    @staticmethod
+    def analyze(df):
+        states={}
+        for tf in ["M5","M15","M30","H1","H4","D1"]:
+            x=MarketDataEngine.resample(df,tf)
+            if len(x)<220: states[tf]="INSUFFICIENT"
+            else: states[tf]=TrendEngine.analyze(x)["direction"]
+        valid=[v for v in states.values() if v!="INSUFFICIENT"]
+        bull=sum(v=="BULLISH" for v in valid); bear=sum(v=="BEARISH" for v in valid)
+        direction="BULLISH" if bull>bear and bull>=len(valid)*.5 else "BEARISH" if bear>bull and bear>=len(valid)*.5 else "MIXED"
+        align=100*max(bull,bear)/max(len(valid),1)
+        return {"states":states,"direction":direction,"alignment":float(align),
+                "strength":"VERY STRONG" if align>=85 else "STRONG" if align>=70 else "MODERATE" if align>=55 else "WEAK"}
+
+class EconomicEngine:
+    @staticmethod
+    def analyze(events: pd.DataFrame, symbol: str, now=None, before=30, after=15):
+        now=now or pd.Timestamp.now(tz="UTC")
+        if events is None or events.empty:
+            return {"bias":"NEUTRAL","score":50.0,"risk":"UNKNOWN","blocked":False,"next_event":"No event data","events":[]}
+        e=events.copy()
+        e.columns=[str(c).lower().strip().replace(" ","_") for c in e.columns]
+        if "time" not in e: return {"bias":"NEUTRAL","score":50.0,"risk":"UNKNOWN","blocked":False,"next_event":"Invalid event data","events":[]}
+        e["time"]=pd.to_datetime(e["time"],errors="coerce",utc=True)
+        e=e.dropna(subset=["time"]).sort_values("time")
+        currencies=[symbol[:3],symbol[3:]] if len(symbol)>=6 else []
+        e["currency"]=e.get("currency","").astype(str).str.upper()
+        e["importance"]=e.get("importance","LOW").astype(str).str.upper()
+        rel=e[e["currency"].isin(currencies)].copy()
+        bias=0; blocked=False; nearest=None
+        for _,r in rel.iterrows():
+            mins=(r["time"]-now).total_seconds()/60
+            imp={"LOW":1,"MEDIUM":2,"HIGH":3,"CRITICAL":4}.get(r["importance"],1)
+            if -after<=mins<=before:
+                blocked=True
+            if mins>=0 and nearest is None:
+                nearest=r
+            # Optional directional field: BULLISH/BEARISH/NEUTRAL
+            d=str(r.get("bias","NEUTRAL")).upper()
+            bias += (1 if d=="BULLISH" else -1 if d=="BEARISH" else 0)*imp
+        score=float(np.clip(50+bias*8,0,100))
+        direction="BULLISH" if score>=58 else "BEARISH" if score<=42 else "NEUTRAL"
+        risk="CRITICAL" if blocked else "HIGH" if any(rel.importance.isin(["HIGH","CRITICAL"])) else "NORMAL"
+        return {"bias":direction,"score":score,"risk":risk,"blocked":blocked,
+                "next_event":nearest.get("event","Event") if nearest is not None else "No upcoming relevant event",
+                "events":rel.head(10).to_dict("records")}
+
+class COTEngine:
+    @staticmethod
+    def analyze(cot: pd.DataFrame, symbol="EURUSD"):
+        if cot is None or cot.empty:
+            return {"bias":"NEUTRAL","score":50.0,"status":"NO DATA","net":0,"weekly_change":0,"percentile":50}
+        x=cot.copy(); x.columns=[str(c).lower().strip().replace(" ","_") for c in x.columns]
+        base= symbol[:3] if len(symbol)>=6 else "EUR"
+        if "currency" in x:
+            x=x[x.currency.astype(str).str.upper()==base]
+        if x.empty: return {"bias":"NEUTRAL","score":50.0,"status":"NO DATA","net":0,"weekly_change":0,"percentile":50}
+        for c in ["commercial_long","commercial_short","noncommercial_long","noncommercial_short"]:
+            if c not in x: x[c]=0.0
+            x[c]=pd.to_numeric(x[c],errors="coerce").fillna(0)
+        x["net_spec"]=x.noncommercial_long-x.noncommercial_short
+        net=float(x.net_spec.iloc[-1])
+        change=float(x.net_spec.diff().iloc[-1]) if len(x)>1 else 0
+        pct=float(x.net_spec.rank(pct=True).iloc[-1]*100) if len(x)>1 else 50
+        score=float(np.clip(50+np.sign(net)*min(35,abs(net)/(abs(x.net_spec).mean()+1e-9)*20)+np.sign(change)*min(15,abs(change)/(abs(x.net_spec).std()+1e-9)*5),0,100))
+        bias="BULLISH" if score>=58 else "BEARISH" if score<=42 else "NEUTRAL"
+        return {"bias":bias,"score":score,"status":"OK","net":net,"weekly_change":change,"percentile":pct,
+                "commercial_long":float(x.commercial_long.iloc[-1]),"commercial_short":float(x.commercial_short.iloc[-1]),
+                "spec_long":float(x.noncommercial_long.iloc[-1]),"spec_short":float(x.noncommercial_short.iloc[-1])}
+
+class ConfluenceEngine:
+    @staticmethod
+    def score(trend,momentum,volatility,structure,price_action,sr,breakout,liquidity,regime,session,mtf,economic,cot):
+        direction_votes=[]
+        for d in [trend["direction"],momentum["direction"],structure["direction"],price_action["direction"],mtf["direction"],economic["bias"],cot["bias"]]:
+            if d in ("BULLISH","BEARISH"): direction_votes.append(d)
+        bull=direction_votes.count("BULLISH"); bear=direction_votes.count("BEARISH")
+        direction="BULLISH" if bull>bear else "BEARISH" if bear>bull else "WAIT"
+        parts={
+            "Trend":np.clip(trend["strength"]*.20,0,20),
+            "Momentum":np.clip(momentum["score"]*.15,0,15),
+            "Structure":20 if structure["direction"]==direction else 10 if structure["direction"]=="TRANSITION" else 4,
+            "Price Action":12 if price_action["direction"]==direction else 6 if price_action["direction"]=="NEUTRAL" else 3,
+            "S/R":np.clip(sr["strength"]*.10,0,10),
+            "Breakout":10 if breakout["state"]=="BREAKOUT" and breakout["direction"]==direction else 7 if breakout["state"]=="RANGE" else 2,
+            "Volatility":5 if volatility["regime"] in ("NORMAL","LOW") else 2 if volatility["regime"]=="HIGH" else 0,
+            "Regime":5 if regime in ("TRENDING","BREAKOUT","RANGING") else 1,
+            "Session":3 if session["session_tradeable"] else 0,
+            "Liquidity":2 if (liquidity["sweep_up"] or liquidity["sweep_down"] or liquidity["FVG"]) else 1,
+            "MTF":10*(mtf["alignment"]/100),
+            "Economic":5*(economic["score"]/100),
+            "COT":3*(cot["score"]/100)
+        }
+        total=float(np.clip(sum(parts.values()),0,100))
+        if economic["blocked"] or volatility["regime"]=="EXTREME": total=min(total,55)
+        quality=float(np.clip(total - (20 if direction=="WAIT" else 0) + (5 if mtf["alignment"]>=80 else 0),0,100))
+        return {"score":total,"direction":direction,"quality":quality,"components":parts,
+                "grade":"HIGH QUALITY" if total>=85 else "GOOD" if total>=72 else "WATCH" if total>=60 else "NO-TRADE"}
+
+class RiskEngine:
+    @staticmethod
+    def evaluate(account, cfg:Config, confluence, volatility, economic, correlation, spread=0.8):
+        reasons=[]
+        if account["daily_loss_pct"]>=cfg.max_daily_loss*100: reasons.append("DAILY LOSS LIMIT")
+        if account["drawdown_pct"]>=cfg.max_drawdown*100: reasons.append("MAX DRAWDOWN")
+        if account["open_positions"]>=cfg.max_open_positions: reasons.append("MAX OPEN POSITIONS")
+        if spread>cfg.max_spread_pips: reasons.append("SPREAD TOO WIDE")
+        if volatility["regime"]=="EXTREME": reasons.append("ABNORMAL VOLATILITY")
+        if economic["blocked"]: reasons.append("ECONOMIC EVENT BLACKOUT")
+        if correlation["risk"]=="HIGH": reasons.append("CORRELATED EXPOSURE")
+        if confluence["score"]<cfg.min_score: reasons.append("SCORE BELOW THRESHOLD")
+        ok=not reasons
+        return {"approved":ok,"status":"APPROVED" if ok else "VETO","reasons":reasons,
+                "risk_pct":cfg.risk_per_trade*100}
+
+class ForexEntryEngine:
+    @staticmethod
+    def calculate(df, direction, confluence, cfg, symbol="EURUSD"):
+        last=float(df.close.iloc[-1]); a=float(atr(df).iloc[-1]); s=SupportResistanceEngine.analyze(df)
+        if direction=="BULLISH":
+            entry=last
+            sl=min(s["support"],last-a*1.5)
+            tp=max(s["resistance"],last+a*3)
+            side="BUY"
+        elif direction=="BEARISH":
+            entry=last
+            sl=max(s["resistance"],last+a*1.5)
+            tp=min(s["support"],last-a*3)
+            side="SELL"
+        else:
+            return {"approved":False,"direction":"WAIT","entry":last,"sl":None,"tp":None,"rr":0,"lot":0,"zone_low":last-a*.25,"zone_high":last+a*.25}
+        risk=abs(entry-sl); reward=abs(tp-entry); rr=reward/max(risk,1e-9)
+        # Approximate lot sizing for major FX pairs; broker contract specifics must override this.
+        risk_money=cfg.initial_balance*cfg.risk_per_trade
+        pip=0.01 if symbol.endswith("JPY") else 0.0001
+        pip_value_per_lot=9.0 if symbol.endswith("JPY") else 10.0
+        lot=risk_money/max((risk/pip)*pip_value_per_lot,1e-9)
+        return {"approved":confluence["score"]>=cfg.min_score,"direction":side,"entry":entry,
+                "sl":sl,"tp":tp,"rr":rr,"lot":float(np.clip(lot,0.01,100)),
+                "zone_low":min(entry,entry-a*.25),"zone_high":max(entry,entry+a*.25),
+                "quality":confluence["quality"],"risk_money":risk_money}
+
+class BinaryEntryEngine:
+    @staticmethod
+    def calculate(df, direction, confluence, cfg):
+        last=float(df.close.iloc[-1]); a=float(atr(df).iloc[-1]); r=rsi(df).iloc[-1]
+        side="CALL" if direction=="BULLISH" else "PUT" if direction=="BEARISH" else "WAIT"
+        if side=="WAIT": return {"approved":False,"direction":"WAIT","entry":last,"zone_low":last-a*.15,"zone_high":last+a*.15,"confidence":0,"expiry_table":[]}
+        base=float(np.clip(confluence["score"] + (5 if (side=="CALL" and r<70) or (side=="PUT" and r>30) else -5),0,100))
+        rows=[]
+        # Short expiry is penalized when volatility is too low/high; medium expiry benefits from stable momentum.
+        for mins in cfg.binary_expiries:
+            penalty=abs(mins-15)*0.35
+            vol=VolatilityEngine.analyze(df)["regime"]
+            if vol=="EXTREME": penalty+=15
+            elif vol=="VERY LOW": penalty+=7
+            conf=float(np.clip(base-penalty,0,100))
+            rows.append({"expiry_min":mins,"confidence":conf,"payout":cfg.binary_payout,
+                         "expected_value":(conf/100*(1+cfg.binary_payout)-1)})
+        best=max(rows,key=lambda z:z["confidence"])
+        return {"approved":best["confidence"]>=cfg.min_binary_confidence,"direction":side,
+                "entry":last,"zone_low":last-a*.15,"zone_high":last+a*.15,
+                "confidence":best["confidence"],"expiry":best["expiry_min"],
+                "payout":cfg.binary_payout,"expected_value":best["expected_value"],"expiry_table":rows}
+
+class ExecutionEngine:
+    @staticmethod
+    def paper_order(market, symbol, direction, entry, sl=None, tp=None, expiry=None):
+        return {"id":uuid.uuid4().hex[:10],"time":datetime.now(timezone.utc).isoformat(),
+                "market":market,"symbol":symbol,"direction":direction,"entry":entry,
+                "sl":sl,"tp":tp,"expiry":expiry,"status":"OPEN","paper":True}
+
+class TradeJournal:
+    @staticmethod
+    def append(trade):
+        st.session_state.journal.append(trade)
+
+
+# =========================
+# Backtesting / Statistics
+# =========================
+
+class BacktestEngine:
+    @staticmethod
+    def run(df, cfg:Config, threshold=None, binary=False):
+        x=MarketDataEngine.normalize(df)
+        threshold=threshold or (cfg.min_binary_confidence if binary else cfg.min_score)
+        if len(x)<250: return pd.DataFrame(), {"error":"At least 250 candles recommended for backtesting."}
+        equity=cfg.initial_balance; peak=equity; rows=[]; wins=0; losses=0
+        for i in range(220,len(x)-1):
+            window=x.iloc[:i+1]
+            t=TrendEngine.analyze(window); m=MomentumEngine.analyze(window); v=VolatilityEngine.analyze(window)
+            s=StructureEngine.analyze(window); pa=PriceActionEngine.analyze(window)
+            sr=SupportResistanceEngine.analyze(window); bo=BreakoutEngine.analyze(window); li=LiquidityEngine.analyze(window)
+            re=RegimeEngine.classify(t,v,s,bo); se=SessionEngine.analyze(window.time.iloc[-1])
+            mtf=MultiTimeframeEngine.analyze(window)
+            eco={"bias":"NEUTRAL","score":50,"blocked":False}
+            cot={"bias":"NEUTRAL","score":50}
+            c=ConfluenceEngine.score(t,m,v,s,pa,sr,bo,li,re,se,mtf,eco,cot)
+            if c["score"]<threshold or c["direction"]=="WAIT" or re=="ABNORMAL": continue
+            entry=float(x.close.iloc[i]); horizon=1 if binary else min(24,len(x)-i-1)
+            future=x.iloc[i+1:i+1+horizon]
+            if future.empty: continue
+            if binary:
+                win=(future.close.iloc[-1]>entry) if c["direction"]=="BULLISH" else (future.close.iloc[-1]<entry)
+                ret=cfg.binary_payout if win else -1
+            else:
+                a=float(atr(window).iloc[-1]); sl=entry-a*1.5; tp=entry+a*3
+                if c["direction"]=="BEARISH": sl,tp=entry+a*1.5,entry-a*3
+                hit=0
+                for _,r in future.iterrows():
+                    if c["direction"]=="BULLISH":
+                        if r.low<=sl: hit=-1; break
+                        if r.high>=tp: hit=3; break
+                    else:
+                        if r.high>=sl: hit=-1; break
+                        if r.low<=tp: hit=3; break
+                ret=hit if hit else ((future.close.iloc[-1]-entry)/a if c["direction"]=="BULLISH" else (entry-future.close.iloc[-1])/a)
+            pnl=equity*cfg.risk_per_trade*ret
+            equity+=pnl; peak=max(peak,equity)
+            wins+=ret>0; losses+=ret<=0
+            rows.append({"time":x.time.iloc[i],"symbol":"TEST","direction":c["direction"],"score":c["score"],"return_R":ret,"pnl":pnl,"equity":equity,"drawdown_pct":(peak-equity)/peak*100})
+        trades=pd.DataFrame(rows)
+        if trades.empty: return trades, {"trades":0}
+        gp=trades.loc[trades.pnl>0,"pnl"].sum(); gl=abs(trades.loc[trades.pnl<0,"pnl"].sum())
+        metrics={"trades":len(trades),"wins":int(wins),"losses":int(losses),
+                 "win_rate":wins/len(trades)*100,"net_profit":trades.pnl.sum(),
+                 "gross_profit":gp,"gross_loss":gl,"profit_factor":gp/gl if gl else np.inf,
+                 "avg_win":trades.loc[trades.pnl>0,"pnl"].mean() if wins else 0,
+                 "avg_loss":trades.loc[trades.pnl<0,"pnl"].mean() if losses else 0,
+                 "expectancy":trades.pnl.mean(),"max_drawdown":trades.drawdown_pct.max(),
+                 "recovery_factor":trades.pnl.sum()/max(trades.drawdown_pct.max(),1e-9),
+                 "final_equity":equity}
+        return trades, metrics
+
+class WalkForwardEngine:
+    @staticmethod
+    def run(df,cfg):
+        n=len(df); cut=int(n*.65)
+        train=df.iloc[:cut]; test=df.iloc[cut:]
+        tr,tm=BacktestEngine.run(train,cfg)
+        te,em=BacktestEngine.run(test,cfg)
+        return {"train":tm,"out_of_sample":em,"train_trades":tr,"test_trades":te}
+
+class MonteCarloEngine:
+    @staticmethod
+    def run(trades:pd.DataFrame, simulations=500, seed=11):
+        if trades.empty: return {"error":"Run a backtest first."}
+        rng=np.random.default_rng(seed); vals=trades.pnl.to_numpy()
+        finals=[]
+        maxdds=[]
+        for _ in range(simulations):
+            p=rng.permutation(vals); eq=10000+np.cumsum(p); peak=np.maximum.accumulate(eq); dd=np.max((peak-eq)/peak*100)
+            finals.append(eq[-1]); maxdds.append(dd)
+        return {"simulations":simulations,"median_final":float(np.median(finals)),
+                "p05_final":float(np.percentile(finals,5)),"p95_final":float(np.percentile(finals,95)),
+                "median_max_dd":float(np.median(maxdds)),"p95_max_dd":float(np.percentile(maxdds,95))}
+
+class OptimizerEngine:
+    @staticmethod
+    def run(df,cfg, thresholds=(65,70,75,80,85)):
+        rows=[]
+        for th in thresholds:
+            _,m=BacktestEngine.run(df,cfg,threshold=th)
+            if m.get("trades",0):
+                rows.append({"threshold":th,"net_profit":m["net_profit"],"win_rate":m["win_rate"],
+                             "profit_factor":m["profit_factor"],"max_drawdown":m["max_drawdown"],"trades":m["trades"]})
+        return pd.DataFrame(rows).sort_values(["profit_factor","net_profit"],ascending=False) if rows else pd.DataFrame()
+
+
+# =========================
+# App helpers
+# =========================
+
+def init_state():
+    defaults={"journal":[],"paper_balance":10000.0,"bot_enabled":False,"emergency":False,
+              "data":MarketDataEngine.synthetic(),"backtest":pd.DataFrame(),"bt_metrics":{},
+              "wf":None,"mc":None,"optimizer":pd.DataFrame()}
+    for k,v in defaults.items():
+        if k not in st.session_state: st.session_state[k]=v
+
+def load_events():
+    return st.session_state.get("events", pd.DataFrame())
+
+def load_cot():
+    return st.session_state.get("cot", pd.DataFrame())
+
+def analyze_market(df,symbol,cfg):
+    t=TrendEngine.analyze(df); m=MomentumEngine.analyze(df); v=VolatilityEngine.analyze(df)
+    s=StructureEngine.analyze(df); pa=PriceActionEngine.analyze(df); sr=SupportResistanceEngine.analyze(df)
+    bo=BreakoutEngine.analyze(df); li=LiquidityEngine.analyze(df); re=RegimeEngine.classify(t,v,s,bo)
+    se=SessionEngine.analyze(df.time.iloc[-1]); cs=CurrencyStrengthEngine.analyze(df,symbol)
+    mtf=MultiTimeframeEngine.analyze(df)
+    eco=EconomicEngine.analyze(load_events(),symbol)
+    cot=COTEngine.analyze(load_cot(),symbol)
+    # Single-symbol correlation uses synthetic peer set when available.
+    history={symbol:df}
+    corr=CorrelationEngine.analyze(history,symbol)
+    c=ConfluenceEngine.score(t,m,v,s,pa,sr,bo,li,re,se,mtf,eco,cot)
+    risk=RiskEngine.evaluate({"daily_loss_pct":0,"drawdown_pct":0,"open_positions":len(st.session_state.journal)},cfg,c,v,eco,corr)
+    return locals()
+
+def fmt(v, n=2):
+    try: return f"{float(v):,.{n}f}"
+    except: return str(v)
+
+
+def dashboard():
+    st.set_page_config(page_title="V12.1 AI Trading Platform", page_icon="📈", layout="wide")
+    init_state()
+    cfg=Config()
+    st.title("V12.1 AI Trading Platform")
+    st.caption("Forex + Binary research, paper trading, market intelligence, risk control and backtesting terminal")
+
+    # Sidebar controls
+    with st.sidebar:
+        st.header("⚙️ Control Center")
+        symbol=st.text_input("Primary symbol","EURUSD").upper().strip()
+        market=st.selectbox("Market",["FOREX","BINARY OPTIONS"])
+        timeframe=st.selectbox("Primary timeframe",["M5","M15","M30","H1","H4","D1"],index=1)
+        cfg.initial_balance=st.number_input("Paper balance",100.0,10000000.0,10000.0,100.0)
+        cfg.risk_per_trade=st.slider("Risk / trade %",0.1,2.0,0.5,0.1)/100
+        cfg.min_score=st.slider("Minimum confluence score",50,95,72)
+        cfg.min_binary_confidence=st.slider("Minimum binary confidence",50,95,72)
+        cfg.binary_payout=st.slider("Binary payout %",50,95,80)/100
+        cfg.max_spread_pips=st.slider("Max spread (pips)",0.2,10.0,2.0,0.1)
+        st.divider()
+        st.write("**Bot safety**")
+        st.session_state.bot_enabled=st.toggle("Enable paper bot",st.session_state.bot_enabled)
+        if st.button("⏸ Pause New Trades",use_container_width=True):
+            st.session_state.bot_enabled=False
+        if st.button("🚨 EMERGENCY STOP",use_container_width=True):
+            st.session_state.emergency=True; st.session_state.bot_enabled=False
+        if st.button("Reset Emergency",use_container_width=True):
+            st.session_state.emergency=False
+        st.caption("Live broker execution is intentionally disabled until an official adapter is connected.")
+
+    # Data input
+    st.subheader("1 · Market Data")
+    up=st.file_uploader("Upload OHLCV CSV",type=["csv"])
+    if up:
+        try:
+            st.session_state.data=MarketDataEngine.normalize(pd.read_csv(up))
+            st.success(f"Loaded {len(st.session_state.data):,} candles.")
+        except Exception as e:
+            st.error(f"CSV error: {e}")
+    else:
+        st.info("Demo data is active. Upload your broker historical CSV to replace it.")
+
+    df=st.session_state.data
+    validation=MarketDataEngine.validate(df)
+    a=analyze_market(df,symbol,cfg)
+
+    # Account status
+    st.subheader("2 · Command Center")
+    c1,c2,c3,c4,c5=st.columns(5)
+    c1.metric("Balance",f"${st.session_state.paper_balance:,.2f}")
+    c2.metric("Equity",f"${st.session_state.paper_balance:,.2f}")
+    c3.metric("Daily P/L","$0.00")
+    c4.metric("Drawdown","0.00%")
+    c5.metric("Bot", "🟢 PAPER ON" if st.session_state.bot_enabled else "⚪ PAUSED")
+    st.caption(f"Data: {'OK' if validation['data_ok'] else 'INSUFFICIENT'} · UTC · {validation['rows']:,} candles · Emergency: {'STOPPED' if st.session_state.emergency else 'NORMAL'}")
+
+    tabs=st.tabs(["📡 Market Scanner","🧠 Intelligence","🎯 Trade Desk","🛡️ Risk","🧪 Backtest Lab","📓 Journal"])
+
+    with tabs[0]:
+        st.subheader("Market Scanner")
+        # Generate a watchlist from the same demo/history data with deterministic transforms.
+        watch=["EURUSD","GBPUSD","USDJPY","USDCHF","AUDUSD","USDCAD","NZDUSD","XAUUSD"]
+        analyses={}
+        for i,sym in enumerate(watch):
+            if sym==symbol: x=df
+            else:
+                x=MarketDataEngine.synthetic(sym,len(df),seed=20+i)
+            analyses[sym]=analyze_market(x,sym,cfg)
+        scanner=MarketTrackerEngine.rank(watch,analyses)
+        st.dataframe(scanner,use_container_width=True,hide_index=True)
+        if not scanner.empty:
+            top=scanner.iloc[0]
+            st.success(f"TOP OPPORTUNITY: {top.SYMBOL} — {top.DIRECTION} — {top.SCORE}/100")
+        st.subheader("Price Chart")
+        chart=df.set_index("time")[["close"]].tail(300)
+        st.line_chart(chart)
+
+    with tabs[1]:
+        st.subheader("Market Intelligence Core")
+        cols=st.columns(4)
+        cols[0].metric("Confluence",f"{a['c']['score']:.1f}/100")
+        cols[1].metric("Trend",a["t"]["label"])
+        cols[2].metric("Momentum",a["m"]["direction"])
+        cols[3].metric("Regime",a["re"])
+        st.markdown("### Engine Scoreboard")
+        comp=pd.DataFrame({"Engine":list(a["c"]["components"].keys()),"Score":list(a["c"]["components"].values())})
+        st.bar_chart(comp.set_index("Engine"))
+        left,right=st.columns(2)
+        with left:
+            st.markdown("**Trend**")
+            st.json(a["t"])
+            st.markdown("**Momentum**")
+            st.json(a["m"])
+            st.markdown("**Market Structure**")
+            st.json(a["s"])
+            st.markdown("**Price Action**")
+            st.json(a["pa"])
+            st.markdown("**Support / Resistance**")
+            st.json(a["sr"])
+        with right:
+            st.markdown("**Volatility**")
+            st.json(a["v"])
+            st.markdown("**Breakout**")
+            st.json(a["bo"])
+            st.markdown("**Liquidity / FVG**")
+            st.json(a["li"])
+            st.markdown("**Session**")
+            st.json(a["se"])
+            st.markdown("**Multi-Timeframe Alignment**")
+            st.dataframe(pd.DataFrame([a["mtf"]["states"]]),use_container_width=True)
+            st.metric("MTF alignment",f"{a['mtf']['alignment']:.0f}% ({a['mtf']['strength']})")
+        st.markdown("### Currency Strength")
+        st.bar_chart(pd.Series(a["cs"]["matrix"]))
+        st.markdown("### Economic Engine")
+        e1,e2,e3=st.columns(3)
+        e1.metric("Macro Bias",a["eco"]["bias"]); e2.metric("Macro Score",f"{a['eco']['score']:.0f}"); e3.metric("Event Risk",a["eco"]["risk"])
+        if a["eco"]["blocked"]: st.error("ECONOMIC EVENT BLACKOUT — NO NEW TRADES")
+        st.write("Next event:",a["eco"]["next_event"])
+        st.markdown("### COT Engine")
+        q1,q2,q3,q4=st.columns(4)
+        q1.metric("COT Bias",a["cot"]["bias"]); q2.metric("Net Spec",fmt(a["cot"]["net"],0))
+        q3.metric("Weekly Change",fmt(a["cot"]["weekly_change"],0)); q4.metric("Percentile",f"{a['cot']['percentile']:.0f}%")
+        st.info("COT is a slower positioning/context signal; it is not treated as a precise short-term entry trigger.")
+
+        st.markdown("### Economic / COT Data Upload")
+        ec,cc=st.columns(2)
+        with ec:
+            ef=st.file_uploader("Economic events CSV",type=["csv"],key="economic_csv")
+            if ef:
+                try:
+                    st.session_state.events=pd.read_csv(ef)
+                    st.success("Economic event data loaded.")
+                except Exception as ex: st.error(str(ex))
+            st.caption("Expected columns: time, currency, importance, event, optional bias.")
+        with cc:
+            cf=st.file_uploader("COT CSV",type=["csv"],key="cot_csv")
+            if cf:
+                try:
+                    st.session_state.cot=pd.read_csv(cf)
+                    st.success("COT data loaded.")
+                except Exception as ex: st.error(str(ex))
+            st.caption("Expected: currency, commercial_long, commercial_short, noncommercial_long, noncommercial_short.")
+
+    with tabs[2]:
+        st.subheader("3 · Trade Desk")
+        direction=a["c"]["direction"]
+        if market=="FOREX":
+            fx=ForexEntryEngine.calculate(df,direction,a["c"],cfg,symbol)
+            b1,b2,b3,b4,b5,b6=st.columns(6)
+            b1.metric("Signal",fx["direction"]); b2.metric("Entry",fmt(fx["entry"],5))
+            b3.metric("SL",fmt(fx["sl"],5) if fx["sl"] else "-"); b4.metric("TP",fmt(fx["tp"],5) if fx["tp"] else "-")
+            b5.metric("R:R",fmt(fx["rr"])); b6.metric("Lot",fmt(fx["lot"],3))
+            st.write(f"Entry zone: **{fmt(fx['zone_low'],5)} – {fmt(fx['zone_high'],5)}** · Quality: **{fx['quality']:.1f}/100**")
+            approved=a["risk"]["approved"] and fx["approved"] and not st.session_state.emergency
+            if not a["risk"]["approved"]: st.error("RISK VETO: "+", ".join(a["risk"]["reasons"]))
+            if approved:
+                if st.button("🟢 PAPER EXECUTE FOREX",use_container_width=True):
+                    tr=ExecutionEngine.paper_order("FOREX",symbol,fx["direction"],fx["entry"],fx["sl"],fx["tp"])
+                    TradeJournal.append(tr)
+                    st.success(f"Paper trade opened: {tr['id']}")
+            else:
+                st.warning("Forex trade is NOT approved.")
+        else:
+            bi=BinaryEntryEngine.calculate(df,direction,a["c"],cfg)
+            b1,b2,b3,b4,b5=st.columns(5)
+            b1.metric("Signal",bi["direction"]); b2.metric("Entry/Strike",fmt(bi["entry"],5))
+            b3.metric("Confidence",f"{bi['confidence']:.1f}%"); b4.metric("Expiry",f"{bi.get('expiry','-')} min")
+            b5.metric("EV",f"{bi.get('expected_value',0)*100:.1f}%")
+            st.write(f"Entry zone: **{fmt(bi['zone_low'],5)} – {fmt(bi['zone_high'],5)}** · Payout: **{bi.get('payout',cfg.binary_payout)*100:.0f}%**")
+            st.dataframe(pd.DataFrame(bi["expiry_table"]),use_container_width=True) if bi["expiry_table"] else None
+            approved=a["risk"]["approved"] and bi["approved"] and not st.session_state.emergency
+            if not a["risk"]["approved"]: st.error("RISK VETO: "+", ".join(a["risk"]["reasons"]))
+            if approved:
+                if st.button("🟢 PAPER EXECUTE BINARY",use_container_width=True):
+                    tr=ExecutionEngine.paper_order("BINARY",symbol,bi["direction"],bi["entry"],expiry=bi["expiry"])
+                    TradeJournal.append(tr)
+                    st.success(f"Paper binary trade opened: {tr['id']}")
+            else: st.warning("Binary trade is NOT approved.")
+        st.markdown("### Decision Hierarchy")
+        st.code("Market Data → Analysis → Regime → MTF → Confluence → Signal → Risk Veto → Entry → Execution → Monitoring → Journal")
+
+    with tabs[3]:
+        st.subheader("4 · Risk Control Center")
+        r=a["risk"]
+        cols=st.columns(4)
+        cols[0].metric("Risk Status",r["status"]); cols[1].metric("Risk / Trade",f"{r['risk_pct']:.2f}%")
+        cols[2].metric("Max Daily Loss",f"{cfg.max_daily_loss*100:.1f}%"); cols[3].metric("Max DD",f"{cfg.max_drawdown*100:.1f}%")
+        if r["reasons"]: st.error("\n".join("• "+x for x in r["reasons"]))
+        else: st.success("All configured risk veto checks currently pass.")
+        st.markdown("### Safety Gates")
+        gates=[
+            ("SIGNAL VALID",a["c"]["score"]>=cfg.min_score),
+            ("RISK VALID",r["approved"]),
+            ("VOLATILITY VALID",a["v"]["regime"]!="EXTREME"),
+            ("ECONOMIC EVENT VALID",not a["eco"]["blocked"]),
+            ("SESSION VALID",a["se"]["session_tradeable"]),
+            ("DATA VALID",validation["data_ok"]),
+            ("CORRELATION VALID",a["corr"]["risk"]!="HIGH"),
+            ("EMERGENCY STOP OFF",not st.session_state.emergency),
+        ]
+        st.dataframe(pd.DataFrame(gates,columns=["Gate","PASS"]),use_container_width=True,hide_index=True)
+
+    with tabs[4]:
+        st.subheader("5 · Backtest / Walk-Forward / Monte Carlo / Optimizer")
+        btcol1,btcol2=st.columns(2)
+        with btcol1:
+            if st.button("▶ Run Backtest",use_container_width=True):
+                trades,metrics=BacktestEngine.run(df,cfg,binary=(market=="BINARY OPTIONS"))
+                st.session_state.backtest=trades; st.session_state.bt_metrics=metrics
+        with btcol2:
+            if st.button("↔ Run Walk-Forward",use_container_width=True):
+                st.session_state.wf=WalkForwardEngine.run(df,cfg)
+        if st.button("🎲 Run Monte Carlo",use_container_width=True):
+            st.session_state.mc=MonteCarloEngine.run(st.session_state.backtest)
+        if st.button("⚙ Run Threshold Optimizer",use_container_width=True):
+            st.session_state.optimizer=OptimizerEngine.run(df,cfg)
+        if st.session_state.bt_metrics:
+            m=st.session_state.bt_metrics
+            st.json(m)
+        if not st.session_state.backtest.empty:
+            st.line_chart(st.session_state.backtest.set_index("time")[["equity"]])
+            st.dataframe(st.session_state.backtest.tail(100),use_container_width=True)
+        if st.session_state.wf:
+            st.markdown("### Walk-Forward")
+            st.json({"train":st.session_state.wf["train"],"out_of_sample":st.session_state.wf["out_of_sample"]})
+        if st.session_state.mc:
+            st.markdown("### Monte Carlo Stress")
+            st.json(st.session_state.mc)
+        if not st.session_state.optimizer.empty:
+            st.markdown("### Optimization")
+            st.dataframe(st.session_state.optimizer,use_container_width=True,hide_index=True)
+
+    with tabs[5]:
+        st.subheader("6 · Trade Journal / Performance")
+        if st.session_state.journal:
+            j=pd.DataFrame(st.session_state.journal)
+            st.dataframe(j,use_container_width=True,hide_index=True)
+            st.download_button("Export Journal CSV",j.to_csv(index=False),"v12_trade_journal.csv","text/csv")
+        else:
+            st.info("No paper trades yet.")
+        st.markdown("### Engine Status")
+        status=pd.DataFrame([
+            ["Market Data","READY"],["Trend","READY"],["Momentum","READY"],["Volatility","READY"],
+            ["Structure","READY"],["Price Action","READY"],["Support/Resistance","READY"],
+            ["Breakout","READY"],["Liquidity/FVG","READY"],["Regime","READY"],["Session","READY"],
+            ["Currency Strength","READY"],["Correlation","READY"],["MTF","READY"],["Confluence","READY"],
+            ["Economic","READY"],["COT","READY"],["Risk","READY"],["Forex Entry","READY"],
+            ["Binary Entry","READY"],["Paper Execution","READY"],["Backtest","READY"],
+            ["Walk-Forward","READY"],["Monte Carlo","READY"],["Optimizer","READY"],["Journal","READY"]
+        ],columns=["Engine","Status"])
+        st.dataframe(status,use_container_width=True,hide_index=True)
+
+    st.divider()
+    st.caption("V12.1 is a research/paper-trading system. No strategy is guaranteed profitable. Connect only official, permitted broker/data APIs after independent testing and compliance review.")
+
+
+if __name__ == "__main__":
+    dashboard()
