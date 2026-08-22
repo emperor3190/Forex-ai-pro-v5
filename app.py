@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import os
+import socket
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -1574,8 +1575,18 @@ class FXCMLiveDataEngine:
     """FXCM FCLite read-only adapter using demo/real account credentials."""
     AUTH_DEMO = "https://endpoints-demo.fxcm.com"
     AUTH_REAL = "https://endpoints.fxcm.com"
+    # FXCM's current FCLite documentation uses endpoints-demo.fxcm.com /
+    # endpoints.fxcm.com for authentication. The legacy REST market-data
+    # service still documents api-demo.fxcm.com / api.fxcm.com for market
+    # requests. Streamlit Cloud may fail normal DNS resolution for the
+    # legacy data hostname, so the connector below includes a DNS-over-HTTPS
+    # fallback while preserving TLS SNI and certificate verification.
     DATA_DEMO = "https://api-demo.fxcm.com"
     DATA_REAL = "https://api.fxcm.com"
+    DNS_DOHEndpoints = (
+        "https://dns.google/resolve",
+        "https://cloudflare-dns.com/dns-query",
+    )
     TF_MAP = {"M1":"m1","M5":"m5","M15":"m15","M30":"m30","H1":"H1","H4":"H4","D1":"D1"}
 
     @staticmethod
@@ -1694,23 +1705,174 @@ class FXCMLiveDataEngine:
         return cache
 
     @classmethod
+    def _resolve_ipv4(cls, hostname, timeout=10):
+        """Resolve a host normally, then via DNS-over-HTTPS if normal DNS fails.
+
+        This is specifically to work around hosted environments where the
+        legacy FXCM market-data hostname can fail local DNS resolution.
+        """
+        try:
+            infos = socket.getaddrinfo(hostname, 443, socket.AF_INET, socket.SOCK_STREAM)
+            ips = []
+            for info in infos:
+                ip = info[4][0]
+                if ip not in ips:
+                    ips.append(ip)
+            if ips:
+                return ips
+        except Exception:
+            pass
+
+        try:
+            import requests
+        except ImportError as e:
+            raise RuntimeError("The requests package is required for FXCM mode.") from e
+
+        last_error = None
+        for doh in cls.DNS_DOHEndpoints:
+            try:
+                headers = {"Accept": "application/dns-json"}
+                if "cloudflare" in doh:
+                    headers = {"Accept": "application/dns-message"}
+                    # Cloudflare's JSON endpoint is more convenient here.
+                    doh_url = "https://cloudflare-dns.com/dns-query"
+                    rr = requests.get(
+                        doh_url,
+                        params={"name": hostname, "type": "A"},
+                        headers={"Accept": "application/dns-json"},
+                        timeout=timeout,
+                    )
+                else:
+                    rr = requests.get(
+                        doh,
+                        params={"name": hostname, "type": "A"},
+                        headers=headers,
+                        timeout=timeout,
+                    )
+                rr.raise_for_status()
+                payload = rr.json()
+                answers = payload.get("Answer", []) if isinstance(payload, dict) else []
+                ips = [a.get("data") for a in answers if a.get("type") == 1 and a.get("data")]
+                if ips:
+                    return ips
+                last_error = RuntimeError(f"DNS-over-HTTPS returned no A record for {hostname}.")
+            except Exception as ex:
+                last_error = ex
+
+        raise RuntimeError(
+            f"Unable to resolve FXCM market-data host '{hostname}'. "
+            f"Local DNS and DNS-over-HTTPS both failed. Last error: {last_error}"
+        )
+
+    @classmethod
+    def _raw_https_request(cls, base_url, method, path, params=None, data=None, headers=None, timeout=20):
+        """Small HTTPS client with explicit DNS fallback and TLS SNI.
+
+        The TCP connection goes to the resolved IP, but TLS SNI and HTTP Host
+        remain the original FXCM hostname, so certificate validation still
+        applies to the intended server. No verify=False shortcut is used.
+        """
+        import http.client
+        import json
+        import socket
+        import ssl
+        from urllib.parse import urlencode, urlparse
+
+        parsed = urlparse(base_url)
+        hostname = parsed.hostname
+        if not hostname:
+            raise RuntimeError(f"Invalid FXCM base URL: {base_url}")
+        port = parsed.port or 443
+        ips = cls._resolve_ipv4(hostname, timeout=min(timeout, 10))
+
+        query = ""
+        if params:
+            query = "?" + urlencode(params, doseq=True)
+        target = path if path.startswith("/") else "/" + path
+        target = target + query
+
+        body = None
+        req_headers = {
+            "Accept": "application/json",
+            "User-Agent": "Forex-AI-Pro-V13/FXCM",
+            "Host": hostname,
+            "Connection": "close",
+        }
+        if headers:
+            req_headers.update(headers)
+        if data is not None:
+            if isinstance(data, (dict, list, tuple)):
+                if isinstance(data, dict):
+                    body = urlencode(data, doseq=True).encode("utf-8")
+                else:
+                    body = urlencode(data, doseq=True).encode("utf-8")
+                req_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+            elif isinstance(data, bytes):
+                body = data
+            else:
+                body = str(data).encode("utf-8")
+            req_headers["Content-Length"] = str(len(body))
+
+        context = ssl.create_default_context()
+        last_error = None
+        for ip in ips:
+            sock = None
+            try:
+                sock = socket.create_connection((ip, port), timeout=timeout)
+                sock.settimeout(timeout)
+                tls_sock = context.wrap_socket(sock, server_hostname=hostname)
+                sock = tls_sock
+                request_line = f"{method.upper()} {target} HTTP/1.1\r\n"
+                header_blob = "".join(f"{k}: {v}\r\n" for k, v in req_headers.items())
+                tls_sock.sendall((request_line + header_blob + "\r\n").encode("utf-8") + (body or b""))
+
+                response = http.client.HTTPResponse(tls_sock)
+                response.begin()
+                raw = response.read()
+                status = response.status
+                reason = response.reason
+                response_headers = dict(response.getheaders())
+                tls_sock.close()
+
+                text = raw.decode("utf-8", errors="replace")
+                try:
+                    payload = json.loads(text) if text else {}
+                except Exception:
+                    payload = text
+                return status, reason, response_headers, payload
+            except Exception as ex:
+                last_error = ex
+                try:
+                    if sock:
+                        sock.close()
+                except Exception:
+                    pass
+
+        raise RuntimeError(
+            f"FXCM HTTPS connection failed for {hostname}: {last_error}"
+        )
+
+    @classmethod
     def _request(cls, method, path, params=None, data=None, retry=True, timeout=20):
         token = cls._ensure_token()
-        session = cls._session()
-        response = session.request(
-            method, token["data_base"].rstrip("/")+"/"+path.lstrip("/"),
-            params=params, data=data,
-            headers={"Authorization":f"Bearer {token['access_token']}"},
+        base = token["data_base"]
+        status, reason, response_headers, payload = cls._raw_https_request(
+            base, method, path, params=params, data=data,
+            headers={"Authorization": f"Bearer {token['access_token']}"},
             timeout=timeout,
         )
-        if response.status_code == 401 and retry:
+        if status == 401 and retry:
             cls._ensure_token(force=True)
-            return cls._request(method,path,params,data,retry=False,timeout=timeout)
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload,dict):
-            info = payload.get("response",{})
-            if isinstance(info,dict) and info.get("executed") is False:
+            return cls._request(method, path, params, data, retry=False, timeout=timeout)
+        if status < 200 or status >= 300:
+            if isinstance(payload, dict):
+                msg = payload.get("error") or payload.get("message") or payload.get("response")
+            else:
+                msg = str(payload)[:300]
+            raise RuntimeError(f"FXCM HTTP {status} {reason}: {msg}")
+        if isinstance(payload, dict):
+            info = payload.get("response", {})
+            if isinstance(info, dict) and info.get("executed") is False:
                 raise RuntimeError(info.get("error") or "FXCM request rejected.")
         return payload
 
