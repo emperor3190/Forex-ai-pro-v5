@@ -27,7 +27,6 @@ import time
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 from typing import Dict, Any, Optional, Tuple
 
 import numpy as np
@@ -686,66 +685,25 @@ class RegimeEngine:
 
 
 class SessionEngine:
-    """Session/market-clock engine.
-
-    Live dashboard analysis must use the current clock, not the timestamp of the
-    last candle. Otherwise a Saturday dashboard can incorrectly display Friday's
-    London/New-York session when the feed's latest candle is stale.
-
-    Session labels use local London/New York/Tokyo clocks so DST changes are handled
-    automatically. Weekend status is fail-closed for live trading.
-    """
-
-    LONDON = ZoneInfo("Europe/London")
-    NEW_YORK = ZoneInfo("America/New_York")
-    TOKYO = ZoneInfo("Asia/Tokyo")
-
     @staticmethod
-    def analyze(ts=None, current_clock=False):
-        if ts is None or current_clock:
-            t = pd.Timestamp.now(tz="UTC")
+    def analyze(ts=None):
+        t = ts or pd.Timestamp.now(tz="UTC")
+        h = int(t.hour)
+        if 0 <= h < 8:
+            s = "ASIAN"
+        elif 8 <= h < 13:
+            s = "LONDON"
+        elif 13 <= h < 17:
+            s = "LONDON/NEW YORK OVERLAP"
+        elif 17 <= h < 22:
+            s = "NEW YORK"
         else:
-            t = pd.Timestamp(ts)
-            if t.tzinfo is None:
-                t = t.tz_localize("UTC")
-            else:
-                t = t.tz_convert("UTC")
-
-        # Forex is closed through the weekend. Keep this explicit so a stale Friday
-        # candle can never make the live dashboard appear tradeable on Saturday/Sunday.
-        weekend = int(t.weekday()) >= 5
-        friday_closed = int(t.weekday()) == 4 and int(t.hour) >= 22
-        sunday_preopen = int(t.weekday()) == 6 and int(t.hour) < 22
-        market_closed = bool(weekend or friday_closed or sunday_preopen)
-
-        if market_closed:
-            s = "MARKET CLOSED"
-        else:
-            london = t.tz_convert(SessionEngine.LONDON)
-            new_york = t.tz_convert(SessionEngine.NEW_YORK)
-            tokyo = t.tz_convert(SessionEngine.TOKYO)
-            london_open = 8 <= london.hour < 17
-            ny_open = 8 <= new_york.hour < 17
-            tokyo_open = 9 <= tokyo.hour < 18
-            if london_open and ny_open:
-                s = "LONDON/NEW YORK OVERLAP"
-            elif london_open:
-                s = "LONDON"
-            elif ny_open:
-                s = "NEW YORK"
-            elif tokyo_open:
-                s = "ASIAN"
-            else:
-                s = "OFF-HOURS"
-
+            s = "OFF-HOURS"
         return {
             "session": s,
-            "hour": int(t.hour),
+            "hour": h,
             "weekday": t.day_name(),
-            "timestamp_utc": t.isoformat(),
-            "market_closed": market_closed,
-            "session_tradeable": (not market_closed) and s not in {"OFF-HOURS", "MARKET CLOSED"},
-            "clock_source": "CURRENT_UTC" if current_clock or ts is None else "CANDLE_TIMESTAMP",
+            "session_tradeable": s != "OFF-HOURS",
         }
 
 
@@ -2619,8 +2577,7 @@ def build_no_data_analysis(symbol, cfg, data_quality=None, reason="NO MARKET DAT
         "grade": "D", "score": 0.0, "decision": "NO TRADE",
         "checks": {"DATA QUALITY": False, "NO MARKET DATA": False},
     }
-    session = {"session": "-", "session_tradeable": False, "market_closed": True, "clock_source": "NO_DATA"}
-    candle_session = dict(session)
+    session = {"session": "-", "session_tradeable": False}
     breakout = {"direction": "NO DATA"}
     liquidity = {"direction": "NO DATA"}
     sr = {}
@@ -2630,7 +2587,7 @@ def build_no_data_analysis(symbol, cfg, data_quality=None, reason="NO MARKET DAT
         "trend": trend, "momentum": momentum, "volatility": volatility,
         "structure": structure, "price_action": price_action, "sr": sr,
         "breakout": breakout, "liquidity": liquidity, "regime": regime,
-        "session": session, "candle_session": candle_session, "currency_strength": currency_strength, "mtf": mtf,
+        "session": session, "currency_strength": currency_strength, "mtf": mtf,
         "economic": economic, "cot": cot, "correlation": correlation,
         "confluence": c, "risk": risk, "advanced_momentum": advanced_momentum,
         "ai": ai, "ensemble": ensemble, "no_trade": no_trade,
@@ -2654,8 +2611,7 @@ def analyze_market(df, symbol, cfg, timeframe=None):
     bo = BreakoutEngine.analyze(df)
     li = LiquidityEngine.analyze(df)
     re = RegimeEngine.classify(t, v, s, bo)
-    se = SessionEngine.analyze(current_clock=True)
-    candle_se = SessionEngine.analyze(df.time.iloc[-1], current_clock=False)
+    se = SessionEngine.analyze(df.time.iloc[-1])
     cs = CurrencyStrengthEngine.analyze(df, symbol)
     # In live mode MTF fetches the exact selected pair independently for every timeframe.
     mtf = MultiTimeframeEngine.analyze(df, symbol=symbol, cfg=cfg)
@@ -2689,7 +2645,7 @@ def analyze_market(df, symbol, cfg, timeframe=None):
     )
     # Advanced layers are advisory gates; they do not replace V12.1 engines.
     advisory = {"trend":t,"momentum":m,"volatility":v,"structure":s,"price_action":pa,"sr":sr,
-                "breakout":bo,"liquidity":li,"regime":re,"session":se,"candle_session":candle_se,"mtf":mtf,"economic":eco,
+                "breakout":bo,"liquidity":li,"regime":re,"session":se,"mtf":mtf,"economic":eco,
                 "cot":cot,"correlation":corr,"confluence":c,"risk":risk}
     advisory["advanced_momentum"] = adv_m
     advisory["ai"] = ai
@@ -2708,7 +2664,6 @@ def analyze_market(df, symbol, cfg, timeframe=None):
         "liquidity": li,
         "regime": re,
         "session": se,
-        "candle_session": candle_se,
         "currency_strength": cs,
         "mtf": mtf,
         "economic": eco,
@@ -3293,7 +3248,7 @@ def dashboard():
         )
 
         d1, d2, d3, d4, d5 = st.columns(5)
-        d1.metric("D1 Bias", daily_direction)
+        d1.metric("Daily Bias", daily_direction)
         d2.metric("Daily Score", f"{daily_score:.1f}/100")
         d3.metric("Trend", daily_trend)
         d4.metric("Momentum", daily_momentum)
@@ -3324,7 +3279,7 @@ def dashboard():
             )
         else:
             st.info(
-                f"D1 planning bias: {daily_direction}. This is higher-timeframe context, not the active {timeframe} entry signal; "
+                f"Daily planning bias: {daily_direction}. The D1 analysis is the higher-timeframe context; "
                 "the selected intraday timeframe must still confirm before any setup is considered. "
                 "This is research analysis, not a guaranteed forecast."
             )
@@ -3348,36 +3303,6 @@ def dashboard():
             f"NO VERIFIED DAILY DATA · {display_symbol(symbol)}/D1. "
             "The daily outlook will appear when the selected pair's D1 feed loads successfully."
         )
-
-    # ========================================================
-    # TIMEFRAME ALIGNMENT — explain D1 vs intraday direction instead of
-    # presenting two valid timeframe analyses as if one were an error.
-    # ========================================================
-    intraday_direction = str(a.get("ensemble", {}).get("direction", "WAIT")).upper()
-    if daily_a and daily_df is not None and not daily_df.empty:
-        daily_bias = str(daily_a.get("c", {}).get("direction", "WAIT")).upper()
-        if daily_bias in {"BULLISH", "BEARISH"} and intraday_direction in {"BULLISH", "BEARISH"}:
-            if daily_bias == intraday_direction:
-                alignment_status = "ALIGNED"
-                alignment_message = f"D1 {daily_bias} agrees with {timeframe} {intraday_direction}."
-            else:
-                alignment_status = "CONFLICT / COUNTER-TREND"
-                alignment_message = (
-                    f"D1 is {daily_bias}, while {timeframe} is {intraday_direction}. "
-                    "These are different timeframes, not duplicate calculations. Treat the intraday signal as counter-trend until confirmation."
-                )
-        elif daily_bias in {"BULLISH", "BEARISH"}:
-            alignment_status = "WAIT FOR INTRADAY CONFIRMATION"
-            alignment_message = f"Higher-timeframe D1 bias is {daily_bias}; the {timeframe} engine is not giving a directional signal."
-        else:
-            alignment_status = "NO D1 DIRECTION"
-            alignment_message = f"D1 is {daily_bias}; use the {timeframe} engines for the active setup."
-        st.subheader("🔄 Higher-Timeframe / Intraday Alignment")
-        al1, al2, al3 = st.columns(3)
-        al1.metric("D1 Bias", daily_bias)
-        al2.metric(f"{timeframe} Signal", intraday_direction)
-        al3.metric("Alignment", alignment_status)
-        st.caption(alignment_message)
 
     st.subheader("2 · Command Center")
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -3544,8 +3469,7 @@ def dashboard():
                 ("Volatility", "v"),
                 ("Breakout", "bo"),
                 ("Liquidity / FVG", "li"),
-                ("Current Market Session", "se"),
-                ("Last Candle Session (reference)", "candle_session"),
+                ("Session", "se"),
             ]:
                 st.markdown(f"**{title}**")
                 st.json(a[key])
