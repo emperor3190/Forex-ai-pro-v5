@@ -4228,6 +4228,164 @@ if __name__ == "__main__":
     dashboard()
 
 
+
+# -------------------- DATA QUALITY & ENGINE HEALTH VERIFICATION --------------------
+@dataclass
+class EngineHealth:
+    name: str
+    status: str
+    runtime_ms: float
+    output_valid: bool
+    critical: bool
+    error: str = ""
+
+class DataQualityEngine:
+    """Independent pre-trade verification of market data quality."""
+
+    REQUIRED = ("time", "open", "high", "low", "close")
+
+    def verify(self, df: pd.DataFrame, max_age_seconds: int = 420) -> Dict[str, Any]:
+        checks = {}
+        errors = []
+        if df is None or df.empty:
+            return {"status": "FAILED", "score": 0.0, "checks": {"non_empty": False},
+                    "errors": ["No market data"]}
+
+        checks["non_empty"] = True
+        missing = [c for c in self.REQUIRED if c not in df.columns]
+        checks["required_columns"] = not missing
+        if missing:
+            errors.append("Missing columns: " + ",".join(missing))
+            return {"status": "FAILED", "score": 0.0, "checks": checks, "errors": errors}
+
+        x = df.copy()
+        checks["ohlc_numeric"] = True
+        for c in ("open", "high", "low", "close"):
+            x[c] = pd.to_numeric(x[c], errors="coerce")
+        if x[list(("open","high","low","close"))].isna().any().any():
+            checks["ohlc_numeric"] = False
+            errors.append("Invalid OHLC values")
+
+        checks["positive_prices"] = bool((x[["open","high","low","close"]] > 0).all().all())
+        if not checks["positive_prices"]:
+            errors.append("Non-positive price detected")
+
+        checks["ohlc_structure"] = bool(
+            (x["high"] >= x[["open","close","low"]].max(axis=1)).all()
+            and (x["low"] <= x[["open","close","high"]].min(axis=1)).all()
+        )
+        if not checks["ohlc_structure"]:
+            errors.append("Impossible OHLC structure")
+
+        t = pd.to_datetime(x["time"], utc=True, errors="coerce")
+        checks["timestamps_valid"] = bool(t.notna().all())
+        if not checks["timestamps_valid"]:
+            errors.append("Invalid timestamps")
+        else:
+            checks["chronological"] = bool(t.is_monotonic_increasing)
+            checks["duplicates"] = int(t.duplicated().sum())
+            if not checks["chronological"]:
+                errors.append("Timestamps are not chronological")
+            if checks["duplicates"]:
+                errors.append("Duplicate timestamps detected")
+
+            latest_age = (pd.Timestamp.now(tz="UTC") - t.iloc[-1]).total_seconds()
+            checks["latest_age_seconds"] = float(max(0.0, latest_age))
+            checks["fresh"] = latest_age <= max_age_seconds
+            if not checks["fresh"]:
+                errors.append(f"Stale market data ({latest_age:.0f}s old)")
+
+        checks["finite_values"] = bool(
+            np.isfinite(x[["open","high","low","close"]].to_numpy(dtype=float)).all()
+        )
+        if not checks["finite_values"]:
+            errors.append("Non-finite OHLC values")
+
+        score = 100.0
+        score -= min(40.0, 15.0 * len(errors))
+        score = float(np.clip(score, 0.0, 100.0))
+        status = "HEALTHY" if not errors else ("DEGRADED" if score >= 60 else "FAILED")
+        return {"status": status, "score": score, "checks": checks, "errors": errors}
+
+
+class EngineHealthVerificationLayer:
+    """Runs analysis engines under a common health contract.
+
+    A failed critical engine or failed market-data verification must veto a
+    trade. Advisory failures are exposed as DEGRADED rather than hidden.
+    """
+
+    def __init__(self):
+        self.data_quality = DataQualityEngine()
+        self.history: Dict[str, EngineHealth] = {}
+
+    @staticmethod
+    def _valid_output(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, dict):
+            return all(v is not None for v in value.values())
+        if isinstance(value, pd.DataFrame):
+            return not value.empty
+        if isinstance(value, (float, int, np.floating, np.integer)):
+            return bool(np.isfinite(value))
+        return True
+
+    def run_engine(self, name: str, fn, critical: bool = False, *args, **kwargs):
+        import time
+        start = time.perf_counter()
+        try:
+            output = fn(*args, **kwargs)
+            valid = self._valid_output(output)
+            status = "HEALTHY" if valid else "FAILED"
+            err = "" if valid else "Invalid/empty engine output"
+        except Exception as exc:
+            output = None
+            valid = False
+            status = "FAILED"
+            err = f"{type(exc).__name__}: {exc}"
+
+        health = EngineHealth(
+            name=name,
+            status=status,
+            runtime_ms=(time.perf_counter() - start) * 1000.0,
+            output_valid=valid,
+            critical=critical,
+            error=err,
+        )
+        self.history[name] = health
+        return output, health
+
+    def summary(self) -> Dict[str, Any]:
+        items = list(self.history.values())
+        failed_critical = [x.name for x in items if x.critical and x.status == "FAILED"]
+        failed = [x.name for x in items if x.status == "FAILED"]
+        status = "FAILED" if failed_critical else ("DEGRADED" if failed else "HEALTHY")
+        return {
+            "status": status,
+            "total_engines": len(items),
+            "healthy_engines": sum(x.status == "HEALTHY" for x in items),
+            "failed_engines": len(failed),
+            "failed_critical": failed_critical,
+            "failed": failed,
+            "details": {
+                x.name: {
+                    "status": x.status,
+                    "runtime_ms": round(x.runtime_ms, 2),
+                    "output_valid": x.output_valid,
+                    "critical": x.critical,
+                    "error": x.error,
+                } for x in items
+            },
+            "trade_veto": bool(failed_critical),
+        }
+
+    def verify_data(self, df: pd.DataFrame, max_age_seconds: int = 420):
+        return self.data_quality.verify(df, max_age_seconds=max_age_seconds)
+
+
+health_layer = EngineHealthVerificationLayer()
+
 # -------------------- FVG ENGINE REGISTRY --------------------
 # Exposed as a standalone engine so the orchestrator/dashboard can consume it
 # without replacing or weakening any existing V13 engine.
@@ -4236,3 +4394,187 @@ fvg_engine = FairValueGapEngine()
 def analyze_fair_value_gap(df: pd.DataFrame) -> Dict[str, Any]:
     """Return the latest active FVG state for the supplied OHLC data."""
     return fvg_engine.detect(df)
+
+
+
+# -------------------- V13 ENGINE HEALTH REGISTRY --------------------
+# Every analysis engine is registered here. The registry verifies execution
+# and output without replacing the engine's own logic.
+V13_ENGINE_REGISTRY = {
+    "TrendEngine": ("TrendEngine", True),
+    "MomentumEngine": ("MomentumEngine", True),
+    "VolatilityEngine": ("VolatilityEngine", True),
+    "TechnicalAnalysis": ("TechnicalAnalysis", True),
+    "PriceAction": ("PriceAction", True),
+    "MarketStructure": ("MarketStructure", True),
+    "SupportResistance": ("SupportResistance", True),
+    "Breakout": ("Breakout", False),
+    "FairValueGap": ("FairValueGap", False),
+    "VolumeFlow": ("VolumeFlow", False),
+    "MarketRegion": ("MarketRegion", False),
+    "CurrencyStrength": ("CurrencyStrength", False),
+    "Correlation": ("Correlation", False),
+    "MultiTimeframe": ("MultiTimeframe", True),
+    "DirectProbability": ("DirectProbability", True),
+    "AIMLPrediction": ("AIMLPrediction", True),
+    "AIConfluence": ("AIConfluence", True),
+    "EnsembleDecision": ("EnsembleDecision", True),
+    "Confidence": ("Confidence", True),
+    "TradeQuality": ("TradeQuality", True),
+    "SignalTiming": ("SignalTiming", True),
+    "RiskControl": ("RiskControl", True),
+    "RiskVeto": ("RiskVeto", True),
+    "NewsEconomicFilter": ("NewsEconomicFilter", True),
+    "CandleTiming": ("CandleTiming", False),
+    "MomentumDirection": ("MomentumDirection", False),
+    "CurrentVolatility": ("CurrentVolatility", False),
+    "MarketTracker": ("MarketTracker", False),
+}
+
+def _health_call(name: str, fn, df: pd.DataFrame, critical: bool):
+    """Execute one engine through the health layer."""
+    return health_layer.run_engine(name, fn, critical, df)
+
+def run_all_v13_engine_health(df: pd.DataFrame,
+                              engine_functions: Dict[str, Any],
+                              max_age_seconds: int = 420) -> Dict[str, Any]:
+    """
+    Central health gate for V13.
+
+    engine_functions contains the actual callable for each available engine.
+    Missing callables are reported explicitly instead of being counted healthy.
+    """
+    data_quality = health_layer.verify_data(df, max_age_seconds=max_age_seconds)
+    health_layer.history.clear()
+
+    if data_quality["status"] == "FAILED":
+        return {
+            "status": "FAILED",
+            "data_quality": data_quality,
+            "engine_health": health_layer.summary(),
+            "healthy_count": 0,
+            "total_required": len(V13_ENGINE_REGISTRY),
+            "trade_veto": True,
+            "reason": "DATA QUALITY FAILURE",
+        }
+
+    missing = []
+    for engine_name, (_, critical) in V13_ENGINE_REGISTRY.items():
+        fn = engine_functions.get(engine_name)
+        if not callable(fn):
+            missing.append(engine_name)
+            health_layer.history[engine_name] = EngineHealth(
+                name=engine_name,
+                status="FAILED",
+                runtime_ms=0.0,
+                output_valid=False,
+                critical=critical,
+                error="Engine callable not wired into health registry",
+            )
+            continue
+        _health_call(engine_name, fn, df, critical)
+
+    summary = health_layer.summary()
+    healthy = summary["healthy_engines"]
+    total = len(V13_ENGINE_REGISTRY)
+    failed_critical = summary["failed_critical"]
+
+    # A missing/failed critical engine always blocks a trade.
+    trade_veto = bool(
+        data_quality["status"] == "FAILED"
+        or failed_critical
+        or len(missing) > 0 and any(
+            V13_ENGINE_REGISTRY[x][1] for x in missing
+        )
+    )
+
+    if trade_veto:
+        overall = "FAILED"
+    elif summary["failed"]:
+        overall = "DEGRADED"
+    else:
+        overall = "HEALTHY"
+
+    return {
+        "status": overall,
+        "data_quality": data_quality,
+        "engine_health": summary,
+        "healthy_count": healthy,
+        "total_required": total,
+        "failed_count": total - healthy,
+        "missing_engines": missing,
+        "health_percent": round((healthy / total) * 100.0, 2) if total else 0.0,
+        "trade_veto": trade_veto,
+    }
+
+
+def build_v13_engine_functions(context: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Adapter registry.
+
+    The existing V13 engine implementations remain authoritative. The
+    orchestrator supplies callables here; the health layer only verifies that
+    they execute and return valid output.
+    """
+    return {
+        # These adapters use existing engine classes/functions when present.
+        # Unavailable optional engines remain explicitly FAILED rather than
+        # being falsely reported as healthy.
+        "TrendEngine": context.get("trend_fn"),
+        "MomentumEngine": context.get("momentum_fn"),
+        "VolatilityEngine": context.get("volatility_fn"),
+        "TechnicalAnalysis": context.get("technical_fn"),
+        "PriceAction": context.get("price_action_fn"),
+        "MarketStructure": context.get("structure_fn"),
+        "SupportResistance": context.get("support_resistance_fn"),
+        "Breakout": context.get("breakout_fn"),
+        "FairValueGap": context.get("fvg_fn"),
+        "VolumeFlow": context.get("volume_flow_fn"),
+        "MarketRegion": context.get("market_region_fn"),
+        "CurrencyStrength": context.get("currency_strength_fn"),
+        "Correlation": context.get("correlation_fn"),
+        "MultiTimeframe": context.get("mtf_fn"),
+        "DirectProbability": context.get("probability_fn"),
+        "AIMLPrediction": context.get("ml_fn"),
+        "AIConfluence": context.get("ai_confluence_fn"),
+        "EnsembleDecision": context.get("ensemble_fn"),
+        "Confidence": context.get("confidence_fn"),
+        "TradeQuality": context.get("trade_quality_fn"),
+        "SignalTiming": context.get("signal_timing_fn"),
+        "RiskControl": context.get("risk_control_fn"),
+        "RiskVeto": context.get("risk_veto_fn"),
+        "NewsEconomicFilter": context.get("news_fn"),
+        "CandleTiming": context.get("candle_timing_fn"),
+        "MomentumDirection": context.get("momentum_direction_fn"),
+        "CurrentVolatility": context.get("current_volatility_fn"),
+        "MarketTracker": context.get("market_tracker_fn"),
+    }
+
+
+def verify_v13_health(df: pd.DataFrame, context: Optional[Dict[str, Any]] = None,
+                      max_age_seconds: int = 420) -> Dict[str, Any]:
+    """Single entry point for the dashboard/decision pipeline."""
+    context = context or {}
+    functions = build_v13_engine_functions(context)
+    return run_all_v13_engine_health(
+        df, functions, max_age_seconds=max_age_seconds
+    )
+
+
+# -------------------- HEALTH DISPLAY HELPERS --------------------
+def v13_health_label(report: Dict[str, Any]) -> str:
+    status = report.get("status", "FAILED")
+    pct = report.get("health_percent", 0.0)
+    return f"{status} — {pct:.1f}% engines healthy"
+
+
+def v13_trade_gate(report: Dict[str, Any]) -> Tuple[bool, str]:
+    """Return (allowed, reason). This is fail-closed."""
+    if report.get("trade_veto"):
+        if report.get("data_quality", {}).get("status") == "FAILED":
+            return False, "NO TRADE: DATA QUALITY FAILURE"
+        failed = report.get("engine_health", {}).get("failed_critical", [])
+        if failed:
+            return False, "NO TRADE: CRITICAL ENGINE FAILURE — " + ", ".join(failed)
+        return False, "NO TRADE: ENGINE HEALTH DEGRADED"
+    return True, "ENGINE HEALTH PASS"
