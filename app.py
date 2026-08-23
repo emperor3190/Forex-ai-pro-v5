@@ -469,6 +469,124 @@ class VolatilityEngine:
         }
 
 
+
+# -------------------- FAIR VALUE GAP ENGINE --------------------
+@dataclass
+class FVGZone:
+    kind: str
+    lower: float
+    upper: float
+    size: float
+    midpoint: float
+    index: int
+    timestamp: str
+    age_bars: int
+    fresh: bool
+    mitigated: bool
+    quality: float
+
+class FairValueGapEngine:
+    """Standalone three-candle Fair Value Gap / imbalance engine."""
+
+    def _atr(self, df: pd.DataFrame, period: int = 14) -> float:
+        if len(df) < period + 2:
+            return float("nan")
+        h = pd.to_numeric(df["high"], errors="coerce")
+        l = pd.to_numeric(df["low"], errors="coerce")
+        c = pd.to_numeric(df["close"], errors="coerce")
+        prev = c.shift(1)
+        tr = pd.concat([(h-l), (h-prev).abs(), (l-prev).abs()], axis=1).max(axis=1)
+        return float(tr.rolling(period).mean().iloc[-1])
+
+    def detect(self, df: pd.DataFrame, lookback: int = 120) -> Dict[str, Any]:
+        base = {
+            "detected": False, "direction": "NONE", "lower": np.nan,
+            "upper": np.nan, "midpoint": np.nan, "size": 0.0,
+            "size_atr": np.nan, "fresh": False, "mitigated": False,
+            "age_bars": 0, "quality": 0.0, "count": 0,
+            "bullish_count": 0, "bearish_count": 0, "signal": "NONE"
+        }
+        if df is None or len(df) < 5:
+            return base
+
+        d = df.copy().reset_index(drop=True)
+        for col in ("high", "low", "close"):
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+        d = d.dropna(subset=["high", "low", "close"]).reset_index(drop=True)
+        if len(d) < 5:
+            return base
+
+        start = max(2, len(d) - lookback)
+        zones = []
+        for i in range(start, len(d)):
+            # Three-candle bullish imbalance.
+            if d.at[i, "low"] > d.at[i-2, "high"]:
+                zones.append(("BULLISH", float(d.at[i-2, "high"]), float(d.at[i, "low"]), i))
+            # Three-candle bearish imbalance.
+            if d.at[i, "high"] < d.at[i-2, "low"]:
+                zones.append(("BEARISH", float(d.at[i, "high"]), float(d.at[i-2, "low"]), i))
+
+        if not zones:
+            return base
+
+        active = []
+        for kind, lower, upper, idx in zones:
+            future = d.iloc[idx+1:]
+            mitigated = False
+            invalidated = False
+            if not future.empty:
+                if kind == "BULLISH":
+                    mitigated = bool((future["low"] <= upper).any())
+                    invalidated = bool((future["close"] < lower).any())
+                else:
+                    mitigated = bool((future["high"] >= lower).any())
+                    invalidated = bool((future["close"] > upper).any())
+            if not invalidated:
+                active.append((kind, lower, upper, idx, mitigated))
+
+        counts = {
+            "count": len(zones),
+            "bullish_count": sum(z[0] == "BULLISH" for z in zones),
+            "bearish_count": sum(z[0] == "BEARISH" for z in zones),
+        }
+        if not active:
+            return {**base, **counts}
+
+        kind, lower, upper, idx, mitigated = active[-1]
+        size = upper - lower
+        age = len(d) - 1 - idx
+        atr = self._atr(d)
+        size_atr = size / atr if np.isfinite(atr) and atr > 0 else np.nan
+
+        quality = 45.0
+        if np.isfinite(size_atr):
+            quality += min(30.0, max(0.0, size_atr * 15.0))
+        quality += 20.0 if not mitigated else 5.0
+        quality -= min(20.0, age * 1.5)
+        quality = float(np.clip(quality, 0.0, 100.0))
+
+        return {
+            **counts,
+            "detected": True,
+            "direction": kind,
+            "lower": lower,
+            "upper": upper,
+            "midpoint": (lower + upper) / 2.0,
+            "size": size,
+            "size_atr": size_atr,
+            "fresh": not mitigated,
+            "mitigated": mitigated,
+            "age_bars": age,
+            "quality": quality,
+            "signal": kind if (not mitigated and quality >= 55.0) else "NONE",
+        }
+
+    def score(self, fvg: Dict[str, Any], direction: str) -> float:
+        if not fvg.get("detected") or fvg.get("signal") != direction:
+            return 0.0
+        return float(np.clip(fvg.get("quality", 0.0), 0.0, 100.0))
+
+
 class StructureEngine:
     @staticmethod
     def analyze(df, lookback=5):
@@ -4108,3 +4226,13 @@ def dashboard():
 
 if __name__ == "__main__":
     dashboard()
+
+
+# -------------------- FVG ENGINE REGISTRY --------------------
+# Exposed as a standalone engine so the orchestrator/dashboard can consume it
+# without replacing or weakening any existing V13 engine.
+fvg_engine = FairValueGapEngine()
+
+def analyze_fair_value_gap(df: pd.DataFrame) -> Dict[str, Any]:
+    """Return the latest active FVG state for the supplied OHLC data."""
+    return fvg_engine.detect(df)
