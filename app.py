@@ -26,7 +26,7 @@ import socket
 import time
 import uuid
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dt_time
 from typing import Dict, Any, Optional, Tuple
 
 import numpy as np
@@ -685,25 +685,87 @@ class RegimeEngine:
 
 
 class SessionEngine:
+    """Authoritative Forex market-calendar and session engine.
+
+    Important safety rule: a session label is NEVER allowed to imply that the
+    Forex market is open. The weekly market calendar is checked first. Live
+    dashboard analysis uses the current UTC clock; historical backtests can
+    pass a candle timestamp explicitly. New York time is used for the weekly
+    Sunday-open/Friday-close boundary and automatically observes DST.
+    """
+
     @staticmethod
-    def analyze(ts=None):
-        t = ts or pd.Timestamp.now(tz="UTC")
-        h = int(t.hour)
-        if 0 <= h < 8:
-            s = "ASIAN"
-        elif 8 <= h < 13:
-            s = "LONDON"
-        elif 13 <= h < 17:
-            s = "LONDON/NEW YORK OVERLAP"
-        elif 17 <= h < 22:
-            s = "NEW YORK"
+    def _to_utc(ts=None):
+        if ts is None:
+            return pd.Timestamp.now(tz="UTC")
+        t = pd.Timestamp(ts)
+        if t.tzinfo is None:
+            return t.tz_localize("UTC")
+        return t.tz_convert("UTC")
+
+    @staticmethod
+    def _market_open(ny):
+        # Standard retail FX weekly schedule: opens Sunday 17:00 New York
+        # and closes Friday 17:00 New York. This deliberately does not
+        # attempt to model broker-specific holiday closures.
+        wd = int(ny.weekday())  # Monday=0 ... Sunday=6
+        tm = ny.time()
+        if wd == 5:  # Saturday
+            return False
+        if wd == 6:  # Sunday
+            return tm >= dt_time(17, 0)
+        if wd == 4:  # Friday
+            return tm < dt_time(17, 0)
+        return True
+
+    @staticmethod
+    def _session_label(ny):
+        # Session windows expressed in New York local time so DST is handled
+        # consistently with the weekly market boundary. Overlap labels have
+        # priority over the individual sessions.
+        m = ny.hour * 60 + ny.minute
+        if 8 * 60 <= m < 12 * 60:
+            return "LONDON/NEW YORK OVERLAP"
+        if 3 * 60 <= m < 8 * 60:
+            return "LONDON"
+        if 8 * 60 <= m < 17 * 60:
+            return "NEW YORK"
+        if 19 * 60 <= m or m < 4 * 60:
+            return "TOKYO"
+        return "SYDNEY"
+
+    @classmethod
+    def analyze(cls, ts=None):
+        t = cls._to_utc(ts)
+        try:
+            ny = t.tz_convert("America/New_York")
+        except Exception:
+            # zoneinfo/tzdata is part of normal Python installations; retain
+            # a safe UTC fallback rather than inventing a session.
+            ny = t
+
+        market_open = cls._market_open(ny)
+        if not market_open:
+            session = "WEEKEND / MARKET CLOSED"
+            tradeable = False
+            status = "MARKET CLOSED"
         else:
-            s = "OFF-HOURS"
+            session = cls._session_label(ny)
+            tradeable = True
+            status = "MARKET OPEN"
+
         return {
-            "session": s,
-            "hour": h,
+            "session": session,
+            "current_session": session,
+            "hour": int(t.hour),
             "weekday": t.day_name(),
-            "session_tradeable": s != "OFF-HOURS",
+            "utc_timestamp": t.isoformat(),
+            "new_york_timestamp": ny.isoformat(),
+            "market_open": bool(market_open),
+            "market_status": status,
+            "session_tradeable": bool(tradeable),
+            "is_weekend": not bool(market_open) and int(ny.weekday()) in (5, 6),
+            "timezone_basis": "America/New_York for weekly boundary; UTC stored",
         }
 
 
@@ -1050,8 +1112,10 @@ class ConfluenceEngine:
         }
 
         total = float(np.clip(sum(parts.values()), 0, 100))
-        if economic["blocked"] or volatility["regime"] == "EXTREME":
+        if (not session.get("market_open", session.get("session_tradeable", False))) or economic["blocked"] or volatility["regime"] == "EXTREME":
             total = min(total, 55)
+        if not session.get("market_open", session.get("session_tradeable", False)):
+            total = 0.0
 
         quality = float(
             np.clip(
@@ -1075,6 +1139,7 @@ class ConfluenceEngine:
             "entry_quality": quality,  # compatibility alias
             "components": parts,
             "grade": grade,
+            "market_open": bool(session.get("market_open", session.get("session_tradeable", False))),
         }
 
 
@@ -1096,6 +1161,8 @@ class RiskEngine:
             reasons.append("ECONOMIC EVENT BLACKOUT")
         if correlation["risk"] == "HIGH":
             reasons.append("CORRELATED EXPOSURE")
+        if not confluence.get("market_open", True):
+            reasons.append("FOREX MARKET CLOSED")
         if confluence["score"] < cfg.min_score:
             reasons.append("SCORE BELOW THRESHOLD")
 
@@ -2156,10 +2223,18 @@ class EnsembleDecisionEngine:
             reasons.append("ENGINE DIRECTION CONFLICT")
         if score < cfg.min_score:
             reasons.append("CONFLUENCE BELOW THRESHOLD")
+        if not a.get("session", {}).get("market_open", a.get("session", {}).get("session_tradeable", False)):
+            reasons.append("FOREX MARKET CLOSED")
+            direction = "WAIT"
+            final = 0.0
 
-        # AI is a soft advisory gate: it can reduce confidence, but does not veto a
-        # signal when the independent technical stack strongly agrees.
-        if ai["confidence"] < cfg.ai_soft_floor and confidence["agreement"] < 80:
+        # Directional AI conflict is a hard safety veto. A technical signal cannot
+        # remain BUY/SELL while the probability engine strongly predicts the opposite.
+        if direction == "BULLISH" and float(ai.get("down_probability", 50.0)) >= 65.0:
+            reasons.append("AI DIRECTIONAL CONFLICT: DOWN >= 65%")
+        elif direction == "BEARISH" and float(ai.get("up_probability", 50.0)) >= 65.0:
+            reasons.append("AI DIRECTIONAL CONFLICT: UP >= 65%")
+        elif ai["confidence"] < cfg.ai_soft_floor and confidence["agreement"] < 80:
             reasons.append("AI MODEL TOO UNCERTAIN")
 
         allowed = (
@@ -2194,8 +2269,9 @@ class NoTradeEngine:
             reasons.append("EXTREME VOLATILITY")
         if a["economic"].get("blocked"):
             reasons.append("HIGH-IMPACT NEWS BLACKOUT")
-        if a["session"].get("session_tradeable") is False:
-            reasons.append("SESSION NOT TRADEABLE")
+        if not a["session"].get("market_open", a["session"].get("session_tradeable", False)):
+            reasons.append("FOREX MARKET CLOSED")
+            reasons.append("NO SESSION IS TRADEABLE WHILE MARKET IS CLOSED")
         if not a.get("risk", {}).get("approved", False):
             reasons.append("RISK VETO")
         return {
@@ -2232,7 +2308,7 @@ class TradeQualityEngine:
             "VOLATILITY": a["volatility"].get("regime") != "EXTREME",
             "REGIME": a.get("regime") not in (None, "NO-TRADE", "ABNORMAL"),
             "MTF": a["mtf"].get("alignment", 0) >= 50,
-            "SESSION": a["session"].get("session_tradeable", True),
+            "SESSION": a["session"].get("market_open", a["session"].get("session_tradeable", False)),
             "NEWS": not a["economic"].get("blocked", False),
             "AI": a["ai"].get("confidence", 0) >= 30 or ensemble.get("agreement", 0) >= 80,
             "RISK": a["risk"].get("approved", False),
@@ -2255,6 +2331,125 @@ class PerformanceIntelligenceEngine:
         keys=[c for c in ["symbol","market","session","regime","expiry"] if c in j.columns]
         result["by_key"]=j.groupby(keys).size().reset_index(name="trades") if keys else pd.DataFrame()
         return result
+
+
+class VolumeFlowEngine:
+    """Volume-flow confirmation layer using the feed's available volume/tick volume."""
+    @staticmethod
+    def analyze(df):
+        x = MarketDataEngine.normalize(df)
+        if len(x) < 30:
+            return {"direction":"NEUTRAL","score":50.0,"volume_z":0.0,"flow_ratio":1.0,"state":"INSUFFICIENT"}
+        v = pd.to_numeric(x["volume"], errors="coerce").fillna(0.0)
+        ret = x["close"].diff()
+        signed = v * np.sign(ret).fillna(0)
+        flow_fast = float(signed.tail(10).sum())
+        flow_slow = float(signed.tail(30).sum())
+        mean = float(v.tail(50).mean())
+        std = float(v.tail(50).std())
+        vz = (float(v.iloc[-1]) - mean) / (std if np.isfinite(std) and std > 0 else 1.0)
+        ratio = (flow_fast / max(abs(flow_slow), 1e-9)) if flow_slow else 0.0
+        direction = "BULLISH" if flow_fast > 0 and flow_slow >= 0 else "BEARISH" if flow_fast < 0 and flow_slow <= 0 else "NEUTRAL"
+        score = float(np.clip(50 + np.sign(flow_fast) * min(35, abs(ratio) * 25) + np.clip(vz, -3, 3) * 4, 0, 100))
+        return {"direction":direction,"score":score,"volume_z":float(vz),"flow_ratio":float(ratio),
+                "state":"EXPANDING" if vz > 0.75 else "CONTRACTING" if vz < -0.75 else "NORMAL"}
+
+
+class DirectProbabilityEngine:
+    """Transparent non-ML directional probability from independent engine votes."""
+    @staticmethod
+    def calculate(a):
+        dirs = [a.get(k, {}).get("direction") for k in ("trend","momentum","structure","price_action","mtf","advanced_momentum","volume_flow")]
+        valid = [d for d in dirs if d in ("BULLISH","BEARISH")]
+        bull = valid.count("BULLISH"); bear = valid.count("BEARISH")
+        if not valid or bull == bear:
+            return {"up_probability":50.0,"down_probability":50.0,"direction":"WAIT","confidence":0.0,"votes":len(valid)}
+        p = 50.0 + 50.0 * (bull - bear) / len(valid)
+        direction = "BULLISH" if bull > bear else "BEARISH"
+        return {"up_probability":float(p),"down_probability":float(100-p),"direction":direction,
+                "confidence":float(abs(p-50)*2),"votes":len(valid),"bull_votes":bull,"bear_votes":bear}
+
+
+class CandleTimingEngine:
+    """Checks whether the current candle is sufficiently formed for a signal."""
+    TF_SECONDS = {"M1":60,"M5":300,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
+    @classmethod
+    def assess(cls, df, timeframe, session):
+        if df is None or df.empty or not session.get("market_open", False):
+            return {"ready":False,"progress_pct":0.0,"remaining_seconds":0.0,"status":"MARKET CLOSED / NO CANDLE"}
+        last = pd.Timestamp(df["time"].iloc[-1])
+        if last.tzinfo is None: last = last.tz_localize("UTC")
+        else: last = last.tz_convert("UTC")
+        now = pd.Timestamp.now(tz="UTC")
+        sec = cls.TF_SECONDS.get(str(timeframe).upper(), 300)
+        elapsed = max(0.0, (now-last).total_seconds())
+        progress = float(np.clip(elapsed/sec*100, 0, 100))
+        remaining = max(0.0, sec-elapsed)
+        # Require a materially formed candle and reject a candle that is too old.
+        ready = 20.0 <= progress <= 100.0 and elapsed <= sec*1.5
+        return {"ready":ready,"progress_pct":progress,"remaining_seconds":remaining,
+                "status":"FORMING" if ready else "WAIT", "last_candle_utc":last.isoformat()}
+
+
+class MarketRegionEngine:
+    """Human-readable regional/session context built on the authoritative calendar."""
+    @staticmethod
+    def analyze(session):
+        if not session.get("market_open", False):
+            return {"region":"WEEKEND / CLOSED","active":False,"overlap":False}
+        name = session.get("session", "")
+        return {"region":name,"active":True,"overlap":"OVERLAP" in name}
+
+
+class BreakEvenEngine:
+    """Calculates a paper-trade break-even trigger; it never modifies broker orders."""
+    @staticmethod
+    def calculate(entry, sl, direction, trigger_rr=1.0, buffer=0.0):
+        if entry is None or sl is None or direction not in ("BUY","SELL"):
+            return {"enabled":False,"trigger":None,"status":"UNAVAILABLE"}
+        risk = abs(float(entry)-float(sl))
+        trigger = float(entry) + risk*trigger_rr + buffer if direction == "BUY" else float(entry) - risk*trigger_rr - buffer
+        return {"enabled":True,"trigger":trigger,"status":"ARMED","trigger_rr":trigger_rr}
+
+
+class SignalExplanationEngine:
+    """Produces explicit, auditable reasons for a final signal or veto."""
+    @staticmethod
+    def explain(a):
+        ens=a.get("ensemble",{}); reasons=[]
+        if a.get("session",{}).get("market_open") is False: reasons.append("Forex market is closed")
+        if a.get("data_quality",{}).get("signal_allowed") is False: reasons.append("Market data is not verified/fresh enough")
+        if ens.get("direction") in ("BULLISH","BEARISH"): reasons.append(f"Final directional stack: {ens['direction']}")
+        if a.get("direct_probability",{}).get("direction") not in (None,"WAIT"): reasons.append(f"Direct probability: {a['direct_probability']['direction']} ({a['direct_probability'].get('confidence',0):.1f}% confidence)")
+        if a.get("volume_flow",{}).get("direction") in ("BULLISH","BEARISH"): reasons.append(f"Volume flow: {a['volume_flow']['direction']}")
+        reasons.extend(ens.get("reasons",[]))
+        return {"summary":"; ".join(dict.fromkeys(reasons)) if reasons else "No verified signal conditions.","reasons":list(dict.fromkeys(reasons))}
+
+
+class RiskVetoEngine:
+    """Final immutable safety gate. Any hard veto forces NO TRADE."""
+    @staticmethod
+    def evaluate(a):
+        veto=[]
+        if not a.get("session",{}).get("market_open",False): veto.append("FOREX MARKET CLOSED")
+        if not a.get("data_quality",{}).get("signal_allowed",False): veto.append("DATA QUALITY / STALE FEED")
+        if not a.get("risk",{}).get("approved",False): veto.append("RISK VETO")
+        if not a.get("no_trade",{}).get("trade_allowed",False): veto.extend(a.get("no_trade",{}).get("reasons",[]))
+        ai=a.get("ai",{}); d=a.get("ensemble",{}).get("direction")
+        if d=="BULLISH" and ai.get("down_probability",0)>=65: veto.append("AI DOWN PROBABILITY CONFLICT")
+        if d=="BEARISH" and ai.get("up_probability",0)>=65: veto.append("AI UP PROBABILITY CONFLICT")
+        return {"veto":bool(veto),"approved":not veto,"reasons":list(dict.fromkeys(veto))}
+
+
+class AnalysisEngine:
+    """Orchestration marker: all analytical engines are consumed before decision."""
+    REQUIRED = ("trend","momentum","volatility","structure","price_action","sr","breakout","liquidity",
+                "regime","session","currency_strength","mtf","economic","cot","correlation",
+                "volume_flow","direct_probability","ai","ensemble","risk","no_trade","trade_quality")
+    @classmethod
+    def audit(cls, analysis):
+        missing=[k for k in cls.REQUIRED if k not in analysis]
+        return {"complete":not missing,"missing":missing,"engine_count":len(cls.REQUIRED)}
 
 def canonical_symbol(symbol: str) -> str:
     """Normalize a dashboard/feed symbol to one canonical key."""
@@ -2611,7 +2806,10 @@ def analyze_market(df, symbol, cfg, timeframe=None):
     bo = BreakoutEngine.analyze(df)
     li = LiquidityEngine.analyze(df)
     re = RegimeEngine.classify(t, v, s, bo)
-    se = SessionEngine.analyze(df.time.iloc[-1])
+    # The dashboard session must reflect the current market clock, not the timestamp
+    # of the last historical candle. This prevents Friday's last candle from making
+    # Sunday morning appear to be an active London/Asian session.
+    se = SessionEngine.analyze()
     cs = CurrencyStrengthEngine.analyze(df, symbol)
     # In live mode MTF fetches the exact selected pair independently for every timeframe.
     mtf = MultiTimeframeEngine.analyze(df, symbol=symbol, cfg=cfg)
@@ -2627,6 +2825,12 @@ def analyze_market(df, symbol, cfg, timeframe=None):
     )
     dq = DataIntegrityEngine.assess(df, timeframe or st.session_state.get("data_timeframe", "M5") or "M5", cfg.data_max_age_seconds)
     adv_m = MomentumDirectionEngine.analyze(df)
+    volume_flow = VolumeFlowEngine.analyze(df)
+    # Add advanced engines to the advisory graph before probability/ensemble decisions.
+    advisory = {"trend":t,"momentum":m,"volatility":v,"structure":s,"price_action":pa,"sr":sr,
+                "breakout":bo,"liquidity":li,"regime":re,"session":se,"mtf":mtf,"economic":eco,
+                "cot":cot,"correlation":corr,"advanced_momentum":adv_m,"volume_flow":volume_flow}
+    direct_probability = DirectProbabilityEngine.calculate(advisory)
     ai = AIProbabilityEngine.predict(df)
 
     risk = RiskEngine.evaluate(
@@ -2644,14 +2848,27 @@ def analyze_market(df, symbol, cfg, timeframe=None):
         corr,
     )
     # Advanced layers are advisory gates; they do not replace V12.1 engines.
-    advisory = {"trend":t,"momentum":m,"volatility":v,"structure":s,"price_action":pa,"sr":sr,
-                "breakout":bo,"liquidity":li,"regime":re,"session":se,"mtf":mtf,"economic":eco,
-                "cot":cot,"correlation":corr,"confluence":c,"risk":risk}
-    advisory["advanced_momentum"] = adv_m
-    advisory["ai"] = ai
+    advisory.update({"confluence":c,"risk":risk,"ai":ai,"direct_probability":direct_probability})
     ensemble = EnsembleDecisionEngine.decide(advisory, ai, dq, cfg)
     no_trade = NoTradeEngine.evaluate(advisory, ensemble, dq, cfg)
     quality = TradeQualityEngine.evaluate(advisory, ensemble, no_trade, dq)
+    advisory["ensemble"] = ensemble
+    advisory["no_trade"] = no_trade
+    advisory["trade_quality"] = quality
+    advisory["data_quality"] = dq
+    timing = CandleTimingEngine.assess(df, timeframe or "M5", se)
+    region = MarketRegionEngine.analyze(se)
+    explanation = SignalExplanationEngine.explain(advisory)
+    analysis_audit = AnalysisEngine.audit(advisory)
+    veto = RiskVetoEngine.evaluate(advisory)
+    if veto["veto"]:
+        ensemble["approved"] = False
+        ensemble["direction"] = "WAIT" if not se.get("market_open",False) else ensemble.get("direction","WAIT")
+        ensemble["reasons"] = list(dict.fromkeys(list(ensemble.get("reasons",[])) + veto["reasons"]))
+        no_trade["trade_allowed"] = False
+        no_trade["reasons"] = list(dict.fromkeys(list(no_trade.get("reasons",[])) + veto["reasons"]))
+        no_trade["status"] = "NO TRADE"
+        quality["decision"] = "NO TRADE"
 
     return {
         "trend": t,
@@ -2672,6 +2889,14 @@ def analyze_market(df, symbol, cfg, timeframe=None):
         "confluence": c,
         "risk": risk,
         "advanced_momentum": adv_m,
+        "volume_flow": volume_flow,
+        "direct_probability": direct_probability,
+        "candle_timing": timing,
+        "market_region": region,
+        "signal_explanation": explanation,
+        "analysis_audit": analysis_audit,
+        "risk_veto": veto,
+        "break_even": BreakEvenEngine.calculate(None, None, "WAIT"),
         "ai": ai,
         "ensemble": ensemble,
         "no_trade": no_trade,
@@ -3330,6 +3555,19 @@ def dashboard():
     if str(cfg.data_source).upper() in {"TWELVE DATA", "MT5 REMOTE", "MT5"} and not st.session_state.live_status.get("connected",False):
         st.warning(f"{cfg.data_source} is selected but no successful live fetch is currently loaded. Signal generation is disabled until the selected pair returns valid candles.")
 
+    # Authoritative market-clock banner. This is independent of candle age.
+    if a.get("session", {}).get("market_open"):
+        st.success(
+            f"🟢 FOREX MARKET OPEN · {a['session']['session']} · "
+            f"UTC {a['session']['utc_timestamp']} · New York {a['session']['new_york_timestamp']}"
+        )
+    else:
+        st.error(
+            f"🔴 FOREX MARKET CLOSED · {a['session']['session']} · "
+            f"UTC {a['session']['utc_timestamp']} · New York {a['session']['new_york_timestamp']} · "
+            "ALL NEW SIGNALS AND PAPER ENTRIES ARE BLOCKED."
+        )
+
     if not df.empty:
         st.info(
             f"PAIR DATA LOCK · {display_symbol(selected_symbol)}/{timeframe} · {resolved_source} · {len(df):,} candles. "
@@ -3442,7 +3680,7 @@ def dashboard():
             f"Engine agreement: {a['ensemble'].get('agreement',0):.0f}% · "
             f"AI model confidence: {a['ai'].get('confidence',0):.1f}%"
         )
-        st.json({"AI":a["ai"],"Advanced Momentum":a["advanced_momentum"],"Ensemble":a["ensemble"],"No Trade":a["no_trade"],"Trade Quality":a["trade_quality"],"Data Quality":a["data_quality"]})
+        st.json({"AI":a["ai"],"Direct Probability":a.get("direct_probability"),"Advanced Momentum":a["advanced_momentum"],"Volume Flow":a.get("volume_flow"),"Candle Timing":a.get("candle_timing"),"Market Region":a.get("market_region"),"Ensemble":a["ensemble"],"Signal Explanation":a.get("signal_explanation"),"Risk Veto":a.get("risk_veto"),"No Trade":a["no_trade"],"Trade Quality":a["trade_quality"],"Data Quality":a["data_quality"]})
         st.markdown("### Engine Scoreboard")
         comp = pd.DataFrame(
             {
@@ -3573,6 +3811,7 @@ def dashboard():
                 a["risk"]["approved"] and fx["approved"] and a["ensemble"].get("approved", False)
                 and a["no_trade"]["trade_allowed"] and a["trade_quality"]["decision"] == "TRADE" and timing["fresh"]
                 and not st.session_state.emergency
+                and a["session"].get("market_open", False)
             )
 
             if not a["risk"]["approved"]:
@@ -3624,6 +3863,7 @@ def dashboard():
                 a["risk"]["approved"] and bi["approved"] and a["ensemble"].get("approved", False)
                 and a["no_trade"]["trade_allowed"] and a["trade_quality"]["decision"] == "TRADE" and timing["fresh"]
                 and not st.session_state.emergency
+                and a["session"].get("market_open", False)
             )
 
             if not a["risk"]["approved"]:
@@ -3674,7 +3914,8 @@ def dashboard():
             ("RISK VALID", r["approved"]),
             ("VOLATILITY VALID", a["v"]["regime"] != "EXTREME"),
             ("ECONOMIC EVENT VALID", not a["eco"]["blocked"]),
-            ("SESSION VALID", a["se"]["session_tradeable"]),
+            ("FOREX MARKET OPEN", a["se"].get("market_open", False)),
+            ("SESSION VALID", a["se"].get("session_tradeable", False)),
             ("DATA VALID", validation["data_ok"]),
             ("CORRELATION VALID", a["corr"]["risk"] != "HIGH"),
             ("EMERGENCY STOP OFF", not st.session_state.emergency),
@@ -3806,6 +4047,14 @@ def dashboard():
                 ["Data Integrity", "READY"],
                 ["Live Connection Manager", "READY"],
                 ["Advanced Momentum", "READY"],
+                ["Volume Flow", "READY"],
+                ["Direct Probability", "READY"],
+                ["Candle Timing", "READY"],
+                ["Market Region", "READY"],
+                ["Break-Even", "READY (PAPER)"],
+                ["Analysis Orchestrator", "READY"],
+                ["Signal Explanation", "READY"],
+                ["Risk Veto", "READY"],
                 ["AI Probability", "READY (OPTIONAL ML)"],
                 ["Ensemble Decision", "READY"],
                 ["Confidence / Trade Quality", "READY"],
