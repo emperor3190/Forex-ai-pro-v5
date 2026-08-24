@@ -22,11 +22,9 @@ from __future__ import annotations
 
 import math
 import os
-import socket
-import time
 import uuid
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone, time as dt_time
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Tuple
 
 import numpy as np
@@ -63,28 +61,18 @@ class Config:
     news_blackout_before: int = 30
     news_blackout_after: int = 15
     demo_rows: int = 1200
-    data_source: str = "TWELVE DATA"
+    data_source: str = "DEMO"
     twelve_data_api_key: str = ""
     twelve_data_outputsize: int = 500
-    # MT5 is the authoritative live source. Twelve Data remains available only when explicitly selected.
-    allow_live_source_failover: bool = False
-    live_refresh_seconds: int = 15
-    mt5_outputsize: int = 500
-    mt5_bridge_url: str = ""
-    mt5_bridge_token: str = ""
-    mt5_bridge_timeout_seconds: int = 10
-    fxcm_outputsize: int = 500
-    fxcm_timeout_seconds: int = 20
-    fxcm_app_name: str = "Forex AI Pro V13"
+    allow_live_source_failover: bool = True
+    live_refresh_seconds: int = 300
     data_max_age_seconds: int = 420
     ml_min_probability: float = 0.60
     signal_max_age_seconds: int = 60
     no_trade_conflict_threshold: float = 18.0
     min_signal_confidence: float = 72.0
     ai_soft_floor: float = 25.0
-    min_engine_agreement: float = 65.0
-    ai_conflict_probability: float = 60.0
-    daily_ai_conflict_probability: float = 55.0
+    min_engine_agreement: float = 60.0
 
 
 # ============================================================
@@ -471,124 +459,6 @@ class VolatilityEngine:
         }
 
 
-
-# -------------------- FAIR VALUE GAP ENGINE --------------------
-@dataclass
-class FVGZone:
-    kind: str
-    lower: float
-    upper: float
-    size: float
-    midpoint: float
-    index: int
-    timestamp: str
-    age_bars: int
-    fresh: bool
-    mitigated: bool
-    quality: float
-
-class FairValueGapEngine:
-    """Standalone three-candle Fair Value Gap / imbalance engine."""
-
-    def _atr(self, df: pd.DataFrame, period: int = 14) -> float:
-        if len(df) < period + 2:
-            return float("nan")
-        h = pd.to_numeric(df["high"], errors="coerce")
-        l = pd.to_numeric(df["low"], errors="coerce")
-        c = pd.to_numeric(df["close"], errors="coerce")
-        prev = c.shift(1)
-        tr = pd.concat([(h-l), (h-prev).abs(), (l-prev).abs()], axis=1).max(axis=1)
-        return float(tr.rolling(period).mean().iloc[-1])
-
-    def detect(self, df: pd.DataFrame, lookback: int = 120) -> Dict[str, Any]:
-        base = {
-            "detected": False, "direction": "NONE", "lower": np.nan,
-            "upper": np.nan, "midpoint": np.nan, "size": 0.0,
-            "size_atr": np.nan, "fresh": False, "mitigated": False,
-            "age_bars": 0, "quality": 0.0, "count": 0,
-            "bullish_count": 0, "bearish_count": 0, "signal": "NONE"
-        }
-        if df is None or len(df) < 5:
-            return base
-
-        d = df.copy().reset_index(drop=True)
-        for col in ("high", "low", "close"):
-            d[col] = pd.to_numeric(d[col], errors="coerce")
-        d = d.dropna(subset=["high", "low", "close"]).reset_index(drop=True)
-        if len(d) < 5:
-            return base
-
-        start = max(2, len(d) - lookback)
-        zones = []
-        for i in range(start, len(d)):
-            # Three-candle bullish imbalance.
-            if d.at[i, "low"] > d.at[i-2, "high"]:
-                zones.append(("BULLISH", float(d.at[i-2, "high"]), float(d.at[i, "low"]), i))
-            # Three-candle bearish imbalance.
-            if d.at[i, "high"] < d.at[i-2, "low"]:
-                zones.append(("BEARISH", float(d.at[i, "high"]), float(d.at[i-2, "low"]), i))
-
-        if not zones:
-            return base
-
-        active = []
-        for kind, lower, upper, idx in zones:
-            future = d.iloc[idx+1:]
-            mitigated = False
-            invalidated = False
-            if not future.empty:
-                if kind == "BULLISH":
-                    mitigated = bool((future["low"] <= upper).any())
-                    invalidated = bool((future["close"] < lower).any())
-                else:
-                    mitigated = bool((future["high"] >= lower).any())
-                    invalidated = bool((future["close"] > upper).any())
-            if not invalidated:
-                active.append((kind, lower, upper, idx, mitigated))
-
-        counts = {
-            "count": len(zones),
-            "bullish_count": sum(z[0] == "BULLISH" for z in zones),
-            "bearish_count": sum(z[0] == "BEARISH" for z in zones),
-        }
-        if not active:
-            return {**base, **counts}
-
-        kind, lower, upper, idx, mitigated = active[-1]
-        size = upper - lower
-        age = len(d) - 1 - idx
-        atr = self._atr(d)
-        size_atr = size / atr if np.isfinite(atr) and atr > 0 else np.nan
-
-        quality = 45.0
-        if np.isfinite(size_atr):
-            quality += min(30.0, max(0.0, size_atr * 15.0))
-        quality += 20.0 if not mitigated else 5.0
-        quality -= min(20.0, age * 1.5)
-        quality = float(np.clip(quality, 0.0, 100.0))
-
-        return {
-            **counts,
-            "detected": True,
-            "direction": kind,
-            "lower": lower,
-            "upper": upper,
-            "midpoint": (lower + upper) / 2.0,
-            "size": size,
-            "size_atr": size_atr,
-            "fresh": not mitigated,
-            "mitigated": mitigated,
-            "age_bars": age,
-            "quality": quality,
-            "signal": kind if (not mitigated and quality >= 55.0) else "NONE",
-        }
-
-    def score(self, fvg: Dict[str, Any], direction: str) -> float:
-        if not fvg.get("detected") or fvg.get("signal") != direction:
-            return 0.0
-        return float(np.clip(fvg.get("quality", 0.0), 0.0, 100.0))
-
-
 class StructureEngine:
     @staticmethod
     def analyze(df, lookback=5):
@@ -804,121 +674,26 @@ class RegimeEngine:
         return "EXTENDED" if trend["strength"] >= 88 else "NO-TRADE"
 
 
-class TechnicalAnalysisEngine:
-    """Unified technical-analysis snapshot used by the health and decision layers.
-
-    This is an orchestration engine, not a replacement for the individual
-    technical engines. It verifies that their outputs form one coherent
-    technical state before the higher-level decision engines consume them.
-    """
-    @staticmethod
-    def analyze(trend, momentum, volatility, structure, price_action):
-        directions = [
-            trend.get("direction"), momentum.get("direction"),
-            structure.get("direction"), price_action.get("direction"),
-        ]
-        valid = [d for d in directions if d in ("BULLISH", "BEARISH")]
-        bull = valid.count("BULLISH")
-        bear = valid.count("BEARISH")
-        direction = "BULLISH" if bull > bear else "BEARISH" if bear > bull else "WAIT"
-        scores = [
-            float(trend.get("strength", 50.0)),
-            float(momentum.get("score", 50.0)),
-            100.0 - float(momentum.get("score", 50.0)) if direction == "BEARISH" else float(momentum.get("score", 50.0)),
-            50.0 if structure.get("direction") == "TRANSITION" else (100.0 if structure.get("direction") == direction else 0.0),
-            100.0 if price_action.get("direction") == direction else 50.0 if price_action.get("direction") == "NEUTRAL" else 0.0,
-        ]
-        return {
-            "direction": direction,
-            "agreement": round(100.0 * max(bull, bear) / max(len(valid), 1), 1),
-            "score": float(np.clip(np.mean(scores), 0.0, 100.0)),
-            "volatility_regime": volatility.get("regime", "UNKNOWN"),
-            "votes": {"bullish": bull, "bearish": bear, "valid": len(valid)},
-        }
-
-
 class SessionEngine:
-    """Authoritative Forex market-calendar and session engine.
-
-    Important safety rule: a session label is NEVER allowed to imply that the
-    Forex market is open. The weekly market calendar is checked first. Live
-    dashboard analysis uses the current UTC clock; historical backtests can
-    pass a candle timestamp explicitly. New York time is used for the weekly
-    Sunday-open/Friday-close boundary and automatically observes DST.
-    """
-
     @staticmethod
-    def _to_utc(ts=None):
-        if ts is None:
-            return pd.Timestamp.now(tz="UTC")
-        t = pd.Timestamp(ts)
-        if t.tzinfo is None:
-            return t.tz_localize("UTC")
-        return t.tz_convert("UTC")
-
-    @staticmethod
-    def _market_open(ny):
-        # Standard retail FX weekly schedule: opens Sunday 17:00 New York
-        # and closes Friday 17:00 New York. This deliberately does not
-        # attempt to model broker-specific holiday closures.
-        wd = int(ny.weekday())  # Monday=0 ... Sunday=6
-        tm = ny.time()
-        if wd == 5:  # Saturday
-            return False
-        if wd == 6:  # Sunday
-            return tm >= dt_time(17, 0)
-        if wd == 4:  # Friday
-            return tm < dt_time(17, 0)
-        return True
-
-    @staticmethod
-    def _session_label(ny):
-        # Session windows expressed in New York local time so DST is handled
-        # consistently with the weekly market boundary. Overlap labels have
-        # priority over the individual sessions.
-        m = ny.hour * 60 + ny.minute
-        if 8 * 60 <= m < 12 * 60:
-            return "LONDON/NEW YORK OVERLAP"
-        if 3 * 60 <= m < 8 * 60:
-            return "LONDON"
-        if 8 * 60 <= m < 17 * 60:
-            return "NEW YORK"
-        if 19 * 60 <= m or m < 4 * 60:
-            return "TOKYO"
-        return "SYDNEY"
-
-    @classmethod
-    def analyze(cls, ts=None):
-        t = cls._to_utc(ts)
-        try:
-            ny = t.tz_convert("America/New_York")
-        except Exception:
-            # zoneinfo/tzdata is part of normal Python installations; retain
-            # a safe UTC fallback rather than inventing a session.
-            ny = t
-
-        market_open = cls._market_open(ny)
-        if not market_open:
-            session = "WEEKEND / MARKET CLOSED"
-            tradeable = False
-            status = "MARKET CLOSED"
+    def analyze(ts=None):
+        t = ts or pd.Timestamp.now(tz="UTC")
+        h = int(t.hour)
+        if 0 <= h < 8:
+            s = "ASIAN"
+        elif 8 <= h < 13:
+            s = "LONDON"
+        elif 13 <= h < 17:
+            s = "LONDON/NEW YORK OVERLAP"
+        elif 17 <= h < 22:
+            s = "NEW YORK"
         else:
-            session = cls._session_label(ny)
-            tradeable = True
-            status = "MARKET OPEN"
-
+            s = "OFF-HOURS"
         return {
-            "session": session,
-            "current_session": session,
-            "hour": int(t.hour),
+            "session": s,
+            "hour": h,
             "weekday": t.day_name(),
-            "utc_timestamp": t.isoformat(),
-            "new_york_timestamp": ny.isoformat(),
-            "market_open": bool(market_open),
-            "market_status": status,
-            "session_tradeable": bool(tradeable),
-            "is_weekend": not bool(market_open) and int(ny.weekday()) in (5, 6),
-            "timezone_basis": "America/New_York for weekly boundary; UTC stored",
+            "session_tradeable": s != "OFF-HOURS",
         }
 
 
@@ -1000,55 +775,24 @@ class MarketTrackerEngine:
 
 
 class MultiTimeframeEngine:
-    """Independent multi-timeframe analysis for the exact selected pair.
-
-    LIVE mode fetches every timeframe independently from the configured live
-    source. DEMO/backtest mode may resample the supplied dataframe.
-    """
-    TIMEFRAMES = ["M5", "M15", "M30", "H1", "H4", "D1"]
-    MIN_HISTORY = 220
-
     @staticmethod
-    def _independent_live_data(symbol, timeframe, cfg):
-        return get_live_pair_data(canonical_symbol(symbol), timeframe, cfg, force=False)
+    def analyze(df):
+        states = {}
+        for tf in ["M5", "M15", "M30", "H1", "H4", "D1"]:
+            x = MarketDataEngine.resample(df, tf)
+            if len(x) < 220:
+                states[tf] = "INSUFFICIENT"
+            else:
+                states[tf] = TrendEngine.analyze(x)["direction"]
 
-    @staticmethod
-    def analyze(df, symbol=None, cfg=None):
-        states, rows, sources, errors = {}, {}, {}, {}
-        live_mode = bool(
-            cfg is not None
-            and str(getattr(cfg, "data_source", "DEMO")).upper() in {"TWELVE DATA", "MT5", "MT5 REMOTE"}
-            and symbol
-        )
-
-        for tf in MultiTimeframeEngine.TIMEFRAMES:
-            x = None
-            source = "RESAMPLED"
-            try:
-                if live_mode:
-                    x, meta = MultiTimeframeEngine._independent_live_data(symbol, tf, cfg)
-                    source = str((meta or {}).get("source", getattr(cfg, "data_source", "LIVE"))).upper()
-                else:
-                    x = MarketDataEngine.resample(df, tf)
-                x = MarketDataEngine.normalize(x)
-                rows[tf] = int(len(x))
-                sources[tf] = source
-                if len(x) < MultiTimeframeEngine.MIN_HISTORY:
-                    states[tf] = "INSUFFICIENT"
-                else:
-                    states[tf] = TrendEngine.analyze(x)["direction"]
-            except Exception as ex:
-                states[tf] = "NO DATA" if live_mode else "INSUFFICIENT"
-                rows[tf] = int(len(x)) if isinstance(x, pd.DataFrame) else 0
-                sources[tf] = source
-                errors[tf] = str(ex)
-
-        valid = [v for v in states.values() if v in ("BULLISH", "BEARISH")]
+        valid = [v for v in states.values() if v != "INSUFFICIENT"]
         bull = sum(v == "BULLISH" for v in valid)
         bear = sum(v == "BEARISH" for v in valid)
         direction = (
-            "BULLISH" if bull > bear and bull >= len(valid) * 0.5
-            else "BEARISH" if bear > bull and bear >= len(valid) * 0.5
+            "BULLISH"
+            if bull > bear and bull >= len(valid) * 0.5
+            else "BEARISH"
+            if bear > bull and bear >= len(valid) * 0.5
             else "MIXED"
         )
         align = 100 * max(bull, bear) / max(len(valid), 1)
@@ -1057,15 +801,11 @@ class MultiTimeframeEngine:
             "direction": direction,
             "alignment": float(align),
             "strength": (
-                "VERY STRONG" if align >= 85 else "STRONG" if align >= 70
-                else "MODERATE" if align >= 55 else "WEAK"
+                "VERY STRONG" if align >= 85
+                else "STRONG" if align >= 70
+                else "MODERATE" if align >= 55
+                else "WEAK"
             ),
-            "rows": rows,
-            "sources": sources,
-            "errors": errors,
-            "live_independent": live_mode,
-            "symbol": canonical_symbol(symbol) if symbol else None,
-            "required_history": MultiTimeframeEngine.MIN_HISTORY,
         }
 
 
@@ -1265,10 +1005,8 @@ class ConfluenceEngine:
         }
 
         total = float(np.clip(sum(parts.values()), 0, 100))
-        if (not session.get("market_open", session.get("session_tradeable", False))) or economic["blocked"] or volatility["regime"] == "EXTREME":
+        if economic["blocked"] or volatility["regime"] == "EXTREME":
             total = min(total, 55)
-        if not session.get("market_open", session.get("session_tradeable", False)):
-            total = 0.0
 
         quality = float(
             np.clip(
@@ -1292,7 +1030,6 @@ class ConfluenceEngine:
             "entry_quality": quality,  # compatibility alias
             "components": parts,
             "grade": grade,
-            "market_open": bool(session.get("market_open", session.get("session_tradeable", False))),
         }
 
 
@@ -1314,8 +1051,6 @@ class RiskEngine:
             reasons.append("ECONOMIC EVENT BLACKOUT")
         if correlation["risk"] == "HIGH":
             reasons.append("CORRELATED EXPOSURE")
-        if not confluence.get("market_open", True):
-            reasons.append("FOREX MARKET CLOSED")
         if confluence["score"] < cfg.min_score:
             reasons.append("SCORE BELOW THRESHOLD")
 
@@ -1742,7 +1477,10 @@ class DataIntegrityEngine:
         diffs = x.time.diff().dt.total_seconds().dropna()
         if len(diffs):
             expected = {"M1":60,"M5":300,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}.get(timeframe,300)
-            missing = int((diffs > expected*1.8).sum())
+            # Daily FX data normally has a Friday-to-Monday weekend gap. Do not
+            # misclassify that normal market closure as missing candles.
+            gap_multiplier = 4.5 if str(timeframe).upper() == "D1" else 1.8
+            missing = int((diffs > expected*gap_multiplier).sum())
             if missing:
                 score -= min(20, missing*2); reasons.append(f"MISSING/GAPPED CANDLES: {missing}")
         last = x.time.iloc[-1]
@@ -1757,6 +1495,131 @@ class DataIntegrityEngine:
         status="EXCELLENT" if score>=90 else "GOOD" if score>=75 else "DEGRADED" if score>=55 else "BAD"
         return {"score":score,"status":status,"reasons":reasons,"stale":stale,"age_seconds":age,
                 "last_timestamp":str(last),"rows":len(x),"signal_allowed":score>=55 and not stale}
+
+
+
+
+class DailySignalAssessmentEngine:
+    """Creates a validated, once-per-UTC-day D1 signal from the full V13 stack.
+
+    The signal is based only on completed D1 candles.  It is cached for the
+    current UTC calendar day so intraday refreshes cannot rewrite the daily
+    signal.  Data-quality failure or missing critical analysis outputs prevents
+    the signal from being locked.
+    """
+
+    REQUIRED_DIRECTIONAL = (
+        "trend", "momentum", "structure", "price_action",
+        "sr", "breakout", "liquidity", "mtf", "advanced_momentum"
+    )
+
+    @staticmethod
+    def completed_d1(df: pd.DataFrame) -> pd.DataFrame:
+        x = MarketDataEngine.normalize(df).copy()
+        if x.empty:
+            return x
+        now = pd.Timestamp.now(tz="UTC")
+        # Only completed calendar days are eligible.  This also removes
+        # Sunday/weekend artefacts and the currently forming daily candle.
+        x = x[x["time"].dt.tz_convert("UTC").dt.date < now.date()].copy()
+        x = x[x["time"].dt.dayofweek < 5].copy()
+        return x.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+
+    @staticmethod
+    def _engine_health(a: Dict[str, Any], dq: Dict[str, Any]) -> Dict[str, Any]:
+        checks = {}
+        for name in DailySignalAssessmentEngine.REQUIRED_DIRECTIONAL:
+            value = a.get(name)
+            ok = isinstance(value, dict) and bool(value)
+            if name == "sr":
+                ok = isinstance(value, dict) and any(k in value for k in ("support", "resistance", "score", "direction"))
+            checks[name] = {"status": "HEALTHY" if ok else "FAILED", "output_valid": ok}
+        for name in ("ai", "confluence", "ensemble", "risk", "economic", "correlation", "currency_strength", "regime", "volatility"):
+            value = a.get(name)
+            ok = isinstance(value, dict) and bool(value) if name != "regime" else bool(value)
+            checks[name] = {"status": "HEALTHY" if ok else "FAILED", "output_valid": ok}
+        healthy = sum(v["status"] == "HEALTHY" for v in checks.values())
+        total = len(checks)
+        return {
+            "status": "HEALTHY" if healthy == total else "DEGRADED" if healthy >= total * .8 else "FAILED",
+            "healthy": healthy, "total": total,
+            "percent": round(healthy / max(total, 1) * 100, 1),
+            "checks": checks,
+            "data_quality": dq,
+        }
+
+    @staticmethod
+    def evaluate(df: pd.DataFrame, symbol: str, cfg: Config) -> Dict[str, Any]:
+        completed = DailySignalAssessmentEngine.completed_d1(df)
+        if completed.empty:
+            return {"status": "UNAVAILABLE", "signal": "WAIT", "reason": "NO COMPLETED D1 CANDLE", "locked": False}
+
+        dq = DataIntegrityEngine.assess(completed, "D1", max(int(cfg.data_max_age_seconds), 432000))
+        # Freshness is measured against the completed candle, so do not reject a
+        # weekend/overnight D1 signal merely because it is older than intraday data.
+        dq = dict(dq)
+        dq["signal_allowed"] = dq.get("score", 0) >= 70 and not any("INVALID" in r for r in dq.get("reasons", []))
+        a = analyze_market(completed, canonical_symbol(symbol), cfg, "D1")
+        health = DailySignalAssessmentEngine._engine_health(a, dq)
+
+        directions = []
+        for key in DailySignalAssessmentEngine.REQUIRED_DIRECTIONAL:
+            value = a.get(key, {})
+            d = str(value.get("direction", "NEUTRAL")).upper() if isinstance(value, dict) else "NEUTRAL"
+            if d in ("BULLISH", "BEARISH"):
+                directions.append(d)
+        bull = directions.count("BULLISH"); bear = directions.count("BEARISH")
+        engine_direction = "BULLISH" if bull > bear else "BEARISH" if bear > bull else "WAIT"
+
+        ai = a.get("ai", {}) or {}
+        up = float(ai.get("up_probability", 50.0) or 50.0)
+        down = float(ai.get("down_probability", 50.0) or 50.0)
+        ai_direction = "BULLISH" if up >= 55 else "BEARISH" if down >= 55 else "NEUTRAL"
+
+        # A materially opposing AI forecast is a daily conflict, not something
+        # the trend engine is allowed to silently override.
+        conflict = (engine_direction in ("BULLISH", "BEARISH") and
+                    ai_direction in ("BULLISH", "BEARISH") and
+                    ai_direction != engine_direction and
+                    max(up, down) >= 60.0)
+
+        ensemble = a.get("ensemble", {}) or {}
+        final_direction = engine_direction
+        reasons = []
+        if not dq["signal_allowed"]:
+            final_direction = "WAIT"; reasons.append("DAILY DATA QUALITY FAILED")
+        if health["status"] == "FAILED":
+            final_direction = "WAIT"; reasons.append("CRITICAL DAILY ENGINE FAILURE")
+        if conflict:
+            final_direction = "WAIT"; reasons.append("AI / TECHNICAL DIRECTION CONFLICT")
+        if final_direction in ("BULLISH", "BEARISH") and engine_direction != final_direction:
+            final_direction = "WAIT"
+        if final_direction == "WAIT" and not reasons:
+            reasons.append("INSUFFICIENT DAILY ENGINE CONSENSUS")
+
+        agreement = max(bull, bear) / max(len(directions), 1) * 100.0
+        confidence = float(ensemble.get("confidence", 0.0) or 0.0)
+        if final_direction in ("BULLISH", "BEARISH"):
+            confidence = min(confidence, agreement, float(dq.get("score", 0.0)))
+
+        latest = completed["time"].iloc[-1]
+        cycle = datetime.now(timezone.utc).date().isoformat()
+        return {
+            "status": "LOCKED" if final_direction in ("BULLISH", "BEARISH") else "UNCONFIRMED",
+            "signal": final_direction,
+            "cycle_utc": cycle,
+            "completed_candle": str(latest),
+            "locked": final_direction in ("BULLISH", "BEARISH"),
+            "engine_direction": engine_direction,
+            "ai_direction": ai_direction,
+            "ai_up": up, "ai_down": down,
+            "engine_agreement": round(agreement, 1),
+            "confidence": round(confidence, 1),
+            "reasons": list(dict.fromkeys(reasons)),
+            "data_quality": dq,
+            "engine_health": health,
+            "analysis": a,
+        }
 
 
 class TwelveDataLiveEngine:
@@ -1789,379 +1652,6 @@ class TwelveDataLiveEngine:
         df=MarketDataEngine.normalize(pd.DataFrame(rows)).sort_values("time").reset_index(drop=True)
         return df, {"source":"TWELVE DATA","rows":len(df),"fetched_at":datetime.now(timezone.utc).isoformat(),
                     "credits_used":r.headers.get("api-credits-used"),"credits_left":r.headers.get("api-credits-left")}
-
-
-class FXCMLiveDataEngine:
-    """FXCM FCLite read-only adapter using demo/real account credentials."""
-    AUTH_DEMO = "https://endpoints-demo.fxcm.com"
-    AUTH_REAL = "https://endpoints.fxcm.com"
-    # FXCM's current FCLite documentation uses endpoints-demo.fxcm.com /
-    # endpoints.fxcm.com for authentication. The legacy REST market-data
-    # service still documents api-demo.fxcm.com / api.fxcm.com for market
-    # requests. Streamlit Cloud may fail normal DNS resolution for the
-    # legacy data hostname, so the connector below includes a DNS-over-HTTPS
-    # fallback while preserving TLS SNI and certificate verification.
-    DATA_DEMO = "https://api-demo.fxcm.com"
-    DATA_REAL = "https://api.fxcm.com"
-    DNS_DOHEndpoints = (
-        "https://dns.google/resolve",
-        "https://cloudflare-dns.com/dns-query",
-    )
-    TF_MAP = {"M1":"m1","M5":"m5","M15":"m15","M30":"m30","H1":"H1","H4":"H4","D1":"D1"}
-
-    @staticmethod
-    def _session():
-        try:
-            import requests
-        except ImportError as e:
-            raise RuntimeError("The requests package is required for FXCM mode.") from e
-        s = requests.Session()
-        s.headers.update({"Accept":"application/json","User-Agent":"Forex-AI-Pro-V13/FXCM"})
-        return s
-
-    @staticmethod
-    def _secret(name, default=""):
-        value = str(os.getenv(name, "") or "").strip()
-        if value:
-            return value
-        try:
-            value = str(st.secrets.get(name, "") or "").strip()
-            if value:
-                return value
-        except Exception:
-            pass
-        return default
-
-    @classmethod
-    def _credentials(cls):
-        login = cls._secret("FXCM_LOGIN_ID")
-        password = cls._secret("FXCM_PASSWORD")
-        environment = cls._secret("FXCM_ENVIRONMENT", "demo").lower()
-        app_name = cls._secret("FXCM_APP_NAME", "Forex AI Pro V13")
-        if environment not in {"demo","real"}:
-            raise RuntimeError("FXCM_ENVIRONMENT must be 'demo' or 'real'.")
-        if not login or not password:
-            raise RuntimeError("FXCM_LOGIN_ID and FXCM_PASSWORD are required in Streamlit Secrets.")
-        return login, password, environment, app_name
-
-    @classmethod
-    def _ensure_token(cls, force=False):
-        cache = st.session_state.setdefault("fxcm_auth", {})
-        now = time.time()
-        if not force and cache.get("access_token") and now < float(cache.get("expires_at",0)) - 10:
-            return cache
-
-        login, password, environment, app_name = cls._credentials()
-        auth_base = cls.AUTH_REAL if environment == "real" else cls.AUTH_DEMO
-        data_base = cls.DATA_REAL if environment == "real" else cls.DATA_DEMO
-        session = cls._session()
-
-        # FXCM documents a one-minute access-token lifetime; refresh before expiry.
-        refresh_token = cache.get("refresh_token")
-        xsrf = cache.get("xsrf_token")
-        if refresh_token and xsrf:
-            try:
-                rr = session.post(
-                    f"{auth_base}/iam/refresh/",
-                    headers={"X-XSRF-TOKEN":xsrf,"X-COOKIE-DOMAIN":"fxcm.com"},
-                    timeout=20,
-                )
-                rr.raise_for_status()
-                payload = rr.json()
-                access = payload.get("accessToken")
-                if access:
-                    cache.update({"access_token":access,
-                                  "refresh_token":payload.get("refreshToken",refresh_token),
-                                  "expires_at":now+50,"environment":environment,
-                                  "data_base":data_base})
-                    return cache
-            except Exception:
-                pass
-
-        tr = session.get(
-            f"{auth_base}/iam/trading-systems/{login}",
-            headers={"X-COOKIE-DOMAIN":"fxcm.com","Accept":"*/*"},
-            timeout=20,
-        )
-        tr.raise_for_status()
-        systems = tr.json()
-        if not isinstance(systems,list) or not systems:
-            raise RuntimeError("FXCM returned no trading-system information for this login.")
-        system = systems[0]
-        session_id = system.get("tradingSessionId")
-        sub_id = system.get("tradingSessionSubId")
-        if not session_id or not sub_id:
-            raise RuntimeError("FXCM did not return tradingSessionId/tradingSessionSubId.")
-
-        xsrf = session.cookies.get("XSRF-TOKEN")
-        if not xsrf:
-            for c in session.cookies:
-                if str(c.name).upper() == "XSRF-TOKEN":
-                    xsrf = c.value
-                    break
-        if not xsrf:
-            raise RuntimeError("FXCM did not return the required XSRF-TOKEN cookie.")
-
-        ar = session.post(
-            f"{auth_base}/iam/authenticate/",
-            json={"loginId":login,"password":password,
-                  "tradingSessionId":session_id,"tradingSessionSubId":sub_id,
-                  "appName":app_name},
-            headers={"Content-Type":"application/json","X-COOKIE-DOMAIN":"fxcm.com",
-                     "X-XSRF-TOKEN":xsrf},
-            timeout=20,
-        )
-        ar.raise_for_status()
-        auth = ar.json()
-        access = auth.get("accessToken")
-        if not access:
-            raise RuntimeError("FXCM authentication returned no access token.")
-        cache.update({"access_token":access,"refresh_token":auth.get("refreshToken"),
-                      "xsrf_token":xsrf,"expires_at":now+50,
-                      "environment":environment,"data_base":data_base,
-                      "trading_session_id":session_id,
-                      "trading_session_sub_id":sub_id,
-                      "authenticated_at":datetime.now(timezone.utc).isoformat()})
-        return cache
-
-    @classmethod
-    def _resolve_ipv4(cls, hostname, timeout=10):
-        """Resolve a host normally, then via DNS-over-HTTPS if normal DNS fails.
-
-        This is specifically to work around hosted environments where the
-        legacy FXCM market-data hostname can fail local DNS resolution.
-        """
-        try:
-            infos = socket.getaddrinfo(hostname, 443, socket.AF_INET, socket.SOCK_STREAM)
-            ips = []
-            for info in infos:
-                ip = info[4][0]
-                if ip not in ips:
-                    ips.append(ip)
-            if ips:
-                return ips
-        except Exception:
-            pass
-
-        try:
-            import requests
-        except ImportError as e:
-            raise RuntimeError("The requests package is required for FXCM mode.") from e
-
-        last_error = None
-        for doh in cls.DNS_DOHEndpoints:
-            try:
-                headers = {"Accept": "application/dns-json"}
-                if "cloudflare" in doh:
-                    headers = {"Accept": "application/dns-message"}
-                    # Cloudflare's JSON endpoint is more convenient here.
-                    doh_url = "https://cloudflare-dns.com/dns-query"
-                    rr = requests.get(
-                        doh_url,
-                        params={"name": hostname, "type": "A"},
-                        headers={"Accept": "application/dns-json"},
-                        timeout=timeout,
-                    )
-                else:
-                    rr = requests.get(
-                        doh,
-                        params={"name": hostname, "type": "A"},
-                        headers=headers,
-                        timeout=timeout,
-                    )
-                rr.raise_for_status()
-                payload = rr.json()
-                answers = payload.get("Answer", []) if isinstance(payload, dict) else []
-                ips = [a.get("data") for a in answers if a.get("type") == 1 and a.get("data")]
-                if ips:
-                    return ips
-                last_error = RuntimeError(f"DNS-over-HTTPS returned no A record for {hostname}.")
-            except Exception as ex:
-                last_error = ex
-
-        raise RuntimeError(
-            f"Unable to resolve FXCM market-data host '{hostname}'. "
-            f"Local DNS and DNS-over-HTTPS both failed. Last error: {last_error}"
-        )
-
-    @classmethod
-    def _raw_https_request(cls, base_url, method, path, params=None, data=None, headers=None, timeout=20):
-        """Small HTTPS client with explicit DNS fallback and TLS SNI.
-
-        The TCP connection goes to the resolved IP, but TLS SNI and HTTP Host
-        remain the original FXCM hostname, so certificate validation still
-        applies to the intended server. No verify=False shortcut is used.
-        """
-        import http.client
-        import json
-        import socket
-        import ssl
-        from urllib.parse import urlencode, urlparse
-
-        parsed = urlparse(base_url)
-        hostname = parsed.hostname
-        if not hostname:
-            raise RuntimeError(f"Invalid FXCM base URL: {base_url}")
-        port = parsed.port or 443
-        ips = cls._resolve_ipv4(hostname, timeout=min(timeout, 10))
-
-        query = ""
-        if params:
-            query = "?" + urlencode(params, doseq=True)
-        target = path if path.startswith("/") else "/" + path
-        target = target + query
-
-        body = None
-        req_headers = {
-            "Accept": "application/json",
-            "User-Agent": "Forex-AI-Pro-V13/FXCM",
-            "Host": hostname,
-            "Connection": "close",
-        }
-        if headers:
-            req_headers.update(headers)
-        if data is not None:
-            if isinstance(data, (dict, list, tuple)):
-                if isinstance(data, dict):
-                    body = urlencode(data, doseq=True).encode("utf-8")
-                else:
-                    body = urlencode(data, doseq=True).encode("utf-8")
-                req_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
-            elif isinstance(data, bytes):
-                body = data
-            else:
-                body = str(data).encode("utf-8")
-            req_headers["Content-Length"] = str(len(body))
-
-        context = ssl.create_default_context()
-        last_error = None
-        for ip in ips:
-            sock = None
-            try:
-                sock = socket.create_connection((ip, port), timeout=timeout)
-                sock.settimeout(timeout)
-                tls_sock = context.wrap_socket(sock, server_hostname=hostname)
-                sock = tls_sock
-                request_line = f"{method.upper()} {target} HTTP/1.1\r\n"
-                header_blob = "".join(f"{k}: {v}\r\n" for k, v in req_headers.items())
-                tls_sock.sendall((request_line + header_blob + "\r\n").encode("utf-8") + (body or b""))
-
-                response = http.client.HTTPResponse(tls_sock)
-                response.begin()
-                raw = response.read()
-                status = response.status
-                reason = response.reason
-                response_headers = dict(response.getheaders())
-                tls_sock.close()
-
-                text = raw.decode("utf-8", errors="replace")
-                try:
-                    payload = json.loads(text) if text else {}
-                except Exception:
-                    payload = text
-                return status, reason, response_headers, payload
-            except Exception as ex:
-                last_error = ex
-                try:
-                    if sock:
-                        sock.close()
-                except Exception:
-                    pass
-
-        raise RuntimeError(
-            f"FXCM HTTPS connection failed for {hostname}: {last_error}"
-        )
-
-    @classmethod
-    def _request(cls, method, path, params=None, data=None, retry=True, timeout=20):
-        token = cls._ensure_token()
-        base = token["data_base"]
-        status, reason, response_headers, payload = cls._raw_https_request(
-            base, method, path, params=params, data=data,
-            headers={"Authorization": f"Bearer {token['access_token']}"},
-            timeout=timeout,
-        )
-        if status == 401 and retry:
-            cls._ensure_token(force=True)
-            return cls._request(method, path, params, data, retry=False, timeout=timeout)
-        if status < 200 or status >= 300:
-            if isinstance(payload, dict):
-                msg = payload.get("error") or payload.get("message") or payload.get("response")
-            else:
-                msg = str(payload)[:300]
-            raise RuntimeError(f"FXCM HTTP {status} {reason}: {msg}")
-        if isinstance(payload, dict):
-            info = payload.get("response", {})
-            if isinstance(info, dict) and info.get("executed") is False:
-                raise RuntimeError(info.get("error") or "FXCM request rejected.")
-        return payload
-
-    @classmethod
-    def _offer_map(cls):
-        payload = cls._request("GET","/trading/get_model/",params=[("models","Offer")])
-        offers = payload.get("offers",[]) if isinstance(payload,dict) else []
-        if not offers and isinstance(payload,dict):
-            data = payload.get("data",{})
-            offers = data.get("offers",[]) if isinstance(data,dict) else []
-        mapping={}
-        for offer in offers or []:
-            if isinstance(offer,dict) and offer.get("offerId") is not None:
-                sym=canonical_symbol(offer.get("currency",""))
-                mapping[sym]={"offer_id":int(offer["offerId"]),"symbol":sym,
-                              "bid":offer.get("sell"),"ask":offer.get("buy"),
-                              "spread":offer.get("spread"),"time":offer.get("time")}
-        return mapping
-
-    @classmethod
-    def _offer(cls,symbol):
-        wanted=canonical_symbol(symbol)
-        offers=cls._offer_map()
-        if wanted not in offers:
-            cls._request("POST","/trading/update_subscriptions/",
-                         data={"symbol":display_symbol(wanted),"visible":"true"})
-            offers=cls._offer_map()
-        if wanted not in offers:
-            raise RuntimeError(f"FXCM does not expose {display_symbol(wanted)}.")
-        return offers[wanted]
-
-    @classmethod
-    def candles(cls,symbol,timeframe="M5",outputsize=500,timeout=20):
-        timeframe=str(timeframe).upper()
-        if timeframe not in cls.TF_MAP:
-            raise ValueError(f"Unsupported FXCM timeframe: {timeframe}")
-        offer=cls._offer(symbol)
-        payload=cls._request(
-            "GET",f"/candles/{offer['offer_id']}/{cls.TF_MAP[timeframe]}/",
-            params={"num":max(1,min(int(outputsize),10000))},timeout=timeout)
-        raw=payload.get("candles",[]) if isinstance(payload,dict) else []
-        rows=[]
-        for c in raw:
-            if not isinstance(c,(list,tuple)) or len(c)<10:
-                continue
-            rows.append({
-                "time":pd.to_datetime(float(c[0]),unit="s",utc=True),
-                "open":c[1],"close":c[2],"high":c[3],"low":c[4],"volume":c[9],
-                "fxcm_ask_open":c[5],"fxcm_ask_close":c[6],
-                "fxcm_ask_high":c[7],"fxcm_ask_low":c[8],
-            })
-        df=MarketDataEngine.normalize(pd.DataFrame(rows))
-        if df.empty:
-            raise RuntimeError(f"FXCM returned no usable candles for {display_symbol(symbol)}/{timeframe}.")
-        try:
-            pip=0.01 if "JPY" in canonical_symbol(symbol) else 0.0001
-            df["spread_pips"]=(df["fxcm_ask_close"].astype(float)-df["close"].astype(float)).abs()/pip
-        except Exception:
-            pass
-        meta={"source":"FXCM","symbol":canonical_symbol(symbol),
-              "requested_symbol":canonical_symbol(symbol),"provider_symbol":display_symbol(symbol),
-              "timeframe":timeframe,"rows":len(df),"offer_id":offer["offer_id"],
-              "tick":{"bid":offer.get("bid"),"ask":offer.get("ask"),
-                      "spread":offer.get("spread"),"time":offer.get("time")},
-              "fetched_at":datetime.now(timezone.utc).isoformat(),
-              "read_only":True,"execution_enabled":False,"synthetic":False,
-              "fxcm_environment":st.session_state.get("fxcm_auth",{}).get("environment","demo")}
-        return df,meta
-
 
 
 class LiveConnectionManager:
@@ -2261,40 +1751,6 @@ class AIProbabilityEngine:
                 "model":model_name,"trade_quality":quality,"training_rows":len(train)}
 
 
-class AIConfluenceEngine:
-    """Explicit AI-vs-engine agreement layer.
-
-    AI probability is never silently overridden by technical trend. If the
-    opposing AI probability reaches the configured conflict floor, the final
-    directional decision must become WAIT.
-    """
-    @staticmethod
-    def calculate(ai: Dict[str, Any], direction: str, floor: float = 60.0) -> Dict[str, Any]:
-        up = float(ai.get("up_probability", 50.0) or 50.0)
-        down = float(ai.get("down_probability", 50.0) or 50.0)
-        # Normalize only tiny floating-point drift; do not manufacture a
-        # probability when the model is unavailable.
-        total = up + down
-        if total > 0 and abs(total - 100.0) > 1e-6:
-            up = up / total * 100.0
-            down = down / total * 100.0
-        ai_direction = "BULLISH" if up > down else "BEARISH" if down > up else "NEUTRAL"
-        opposing = down if direction == "BULLISH" else up if direction == "BEARISH" else 0.0
-        conflict = direction in ("BULLISH", "BEARISH") and opposing >= float(floor)
-        alignment = (up if direction == "BULLISH" else down if direction == "BEARISH" else 50.0)
-        return {
-            "direction": direction,
-            "ai_direction": ai_direction,
-            "up_probability": float(up),
-            "down_probability": float(down),
-            "opposing_probability": float(opposing),
-            "conflict_floor": float(floor),
-            "conflict": bool(conflict),
-            "alignment": float(alignment),
-            "status": "CONFLICT" if conflict else "ALIGNED" if direction == ai_direction else "MIXED",
-        }
-
-
 class SignalConfidenceEngine:
     """Final signal-confidence layer built from independent engine agreement.
 
@@ -2379,28 +1835,29 @@ class EnsembleDecisionEngine:
     @staticmethod
     def decide(a, ai, data_quality, cfg):
         score = float(a["confluence"]["score"])
-        technical_direction = a["confluence"]["direction"]
+        direction = a["confluence"]["direction"]
         ai_dir = "BULLISH" if ai["up_probability"] > 55 else "BEARISH" if ai["down_probability"] > 55 else "NEUTRAL"
+        momentum = a.get("advanced_momentum", {}).get("direction", "NEUTRAL")
+
+        # Determine a directional consensus before confidence is calculated.
         vote_set = [
             a.get("trend", {}).get("direction"),
             a.get("momentum", {}).get("direction"),
             a.get("structure", {}).get("direction"),
             a.get("price_action", {}).get("direction"),
             a.get("mtf", {}).get("direction"),
-            a.get("advanced_momentum", {}).get("direction"),
-            a.get("volume_flow", {}).get("direction"),
-            a.get("fvg", {}).get("direction"),
+            momentum,
             ai_dir,
         ]
         bull = sum(v == "BULLISH" for v in vote_set)
         bear = sum(v == "BEARISH" for v in vote_set)
-        direction = technical_direction if technical_direction in ("BULLISH", "BEARISH") else (
-            "BULLISH" if bull > bear else "BEARISH" if bear > bull else "WAIT"
-        )
+        if direction not in ("BULLISH", "BEARISH"):
+            direction = "BULLISH" if bull > bear else "BEARISH" if bear > bull else "WAIT"
 
         confidence = SignalConfidenceEngine.calculate(a, ai, data_quality, direction)
         final = confidence["confidence"]
         reasons = []
+
         if not data_quality.get("signal_allowed", False):
             reasons.append("DATA QUALITY / STALE FEED")
         if direction == "WAIT":
@@ -2410,34 +1867,27 @@ class EnsembleDecisionEngine:
         if score < cfg.min_score:
             reasons.append("CONFLUENCE BELOW THRESHOLD")
 
-        market_open = a.get("session", {}).get("market_open", a.get("session", {}).get("session_tradeable", False))
-        if not market_open:
-            reasons.append("FOREX MARKET CLOSED")
-            direction = "WAIT"
-            final = 0.0
-
-        tf = str(a.get("_timeframe", "")).upper()
-        floor = cfg.daily_ai_conflict_probability if tf == "D1" else cfg.ai_conflict_probability
-        opposing_prob = (
-            float(ai.get("down_probability", 50.0)) if direction == "BULLISH"
-            else float(ai.get("up_probability", 50.0)) if direction == "BEARISH" else 0.0
-        )
-        ai_conflict = direction in ("BULLISH", "BEARISH") and opposing_prob >= floor
-        if ai_conflict:
-            reasons.append(f"AI DIRECTIONAL CONFLICT: OPPOSING PROBABILITY {opposing_prob:.1f}% >= {floor:.1f}%")
-            direction = "WAIT"
-            final = 0.0
-        elif ai["confidence"] < cfg.ai_soft_floor and confidence["agreement"] < 80:
+        # AI is a soft advisory gate: it can reduce confidence, but does not veto a
+        # signal when the independent technical stack strongly agrees.
+        if ai["confidence"] < cfg.ai_soft_floor and confidence["agreement"] < 80:
             reasons.append("AI MODEL TOO UNCERTAIN")
 
-        allowed = direction in ("BULLISH", "BEARISH") and final >= cfg.min_signal_confidence and not reasons
+        allowed = (
+            direction in ("BULLISH", "BEARISH")
+            and final >= cfg.min_signal_confidence
+            and not reasons
+        )
         return {
-            "score": final, "confidence": final, "direction": direction,
-            "ai_direction": ai_dir, "agreement": confidence["agreement"],
-            "ai_alignment": confidence["ai_alignment"], "ai_conflict": ai_conflict,
-            "ai_conflict_floor": floor, "opposing_ai_probability": opposing_prob,
-            "approved": allowed, "reasons": list(dict.fromkeys(reasons)),
-            "components": confidence["components"], "confluence_score": score,
+            "score": final,
+            "confidence": final,
+            "direction": direction,
+            "ai_direction": ai_dir,
+            "agreement": confidence["agreement"],
+            "ai_alignment": confidence["ai_alignment"],
+            "approved": allowed,
+            "reasons": list(dict.fromkeys(reasons)),
+            "components": confidence["components"],
+            "confluence_score": score,
             "grade": "A" if final >= 85 else "B" if final >= 75 else "C" if final >= 65 else "D",
         }
 
@@ -2454,9 +1904,8 @@ class NoTradeEngine:
             reasons.append("EXTREME VOLATILITY")
         if a["economic"].get("blocked"):
             reasons.append("HIGH-IMPACT NEWS BLACKOUT")
-        if not a["session"].get("market_open", a["session"].get("session_tradeable", False)):
-            reasons.append("FOREX MARKET CLOSED")
-            reasons.append("NO SESSION IS TRADEABLE WHILE MARKET IS CLOSED")
+        if a["session"].get("session_tradeable") is False:
+            reasons.append("SESSION NOT TRADEABLE")
         if not a.get("risk", {}).get("approved", False):
             reasons.append("RISK VETO")
         return {
@@ -2493,7 +1942,7 @@ class TradeQualityEngine:
             "VOLATILITY": a["volatility"].get("regime") != "EXTREME",
             "REGIME": a.get("regime") not in (None, "NO-TRADE", "ABNORMAL"),
             "MTF": a["mtf"].get("alignment", 0) >= 50,
-            "SESSION": a["session"].get("market_open", a["session"].get("session_tradeable", False)),
+            "SESSION": a["session"].get("session_tradeable", True),
             "NEWS": not a["economic"].get("blocked", False),
             "AI": a["ai"].get("confidence", 0) >= 30 or ensemble.get("agreement", 0) >= 80,
             "RISK": a["risk"].get("approved", False),
@@ -2517,133 +1966,6 @@ class PerformanceIntelligenceEngine:
         result["by_key"]=j.groupby(keys).size().reset_index(name="trades") if keys else pd.DataFrame()
         return result
 
-
-class VolumeFlowEngine:
-    """Volume-flow confirmation layer using the feed's available volume/tick volume."""
-    @staticmethod
-    def analyze(df):
-        x = MarketDataEngine.normalize(df)
-        if len(x) < 30:
-            return {"direction":"NEUTRAL","score":50.0,"volume_z":0.0,"flow_ratio":1.0,"state":"INSUFFICIENT"}
-        v = pd.to_numeric(x["volume"], errors="coerce").fillna(0.0)
-        ret = x["close"].diff()
-        signed = v * np.sign(ret).fillna(0)
-        flow_fast = float(signed.tail(10).sum())
-        flow_slow = float(signed.tail(30).sum())
-        mean = float(v.tail(50).mean())
-        std = float(v.tail(50).std())
-        vz = (float(v.iloc[-1]) - mean) / (std if np.isfinite(std) and std > 0 else 1.0)
-        ratio = (flow_fast / max(abs(flow_slow), 1e-9)) if flow_slow else 0.0
-        direction = "BULLISH" if flow_fast > 0 and flow_slow >= 0 else "BEARISH" if flow_fast < 0 and flow_slow <= 0 else "NEUTRAL"
-        score = float(np.clip(50 + np.sign(flow_fast) * min(35, abs(ratio) * 25) + np.clip(vz, -3, 3) * 4, 0, 100))
-        return {"direction":direction,"score":score,"volume_z":float(vz),"flow_ratio":float(ratio),
-                "state":"EXPANDING" if vz > 0.75 else "CONTRACTING" if vz < -0.75 else "NORMAL"}
-
-
-class DirectProbabilityEngine:
-    """Transparent non-ML directional probability from independent engine votes."""
-    @staticmethod
-    def calculate(a):
-        dirs = [a.get(k, {}).get("direction") for k in ("trend","momentum","structure","price_action","mtf","advanced_momentum","volume_flow","fvg")]
-        valid = [d for d in dirs if d in ("BULLISH","BEARISH")]
-        bull = valid.count("BULLISH"); bear = valid.count("BEARISH")
-        if not valid or bull == bear:
-            return {"up_probability":50.0,"down_probability":50.0,"direction":"WAIT","confidence":0.0,"votes":len(valid)}
-        p = 50.0 + 50.0 * (bull - bear) / len(valid)
-        direction = "BULLISH" if bull > bear else "BEARISH"
-        return {"up_probability":float(p),"down_probability":float(100-p),"direction":direction,
-                "confidence":float(abs(p-50)*2),"votes":len(valid),"bull_votes":bull,"bear_votes":bear}
-
-
-class CandleTimingEngine:
-    """Checks whether the current candle is sufficiently formed for a signal."""
-    TF_SECONDS = {"M1":60,"M5":300,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
-    @classmethod
-    def assess(cls, df, timeframe, session):
-        if df is None or df.empty or not session.get("market_open", False):
-            return {"ready":False,"progress_pct":0.0,"remaining_seconds":0.0,"status":"MARKET CLOSED / NO CANDLE"}
-        last = pd.Timestamp(df["time"].iloc[-1])
-        if last.tzinfo is None: last = last.tz_localize("UTC")
-        else: last = last.tz_convert("UTC")
-        now = pd.Timestamp.now(tz="UTC")
-        sec = cls.TF_SECONDS.get(str(timeframe).upper(), 300)
-        elapsed = max(0.0, (now-last).total_seconds())
-        progress = float(np.clip(elapsed/sec*100, 0, 100))
-        remaining = max(0.0, sec-elapsed)
-        # Require a materially formed candle and reject a candle that is too old.
-        ready = 20.0 <= progress <= 100.0 and elapsed <= sec*1.5
-        return {"ready":ready,"progress_pct":progress,"remaining_seconds":remaining,
-                "status":"FORMING" if ready else "WAIT", "last_candle_utc":last.isoformat()}
-
-
-class MarketRegionEngine:
-    """Human-readable regional/session context built on the authoritative calendar."""
-    @staticmethod
-    def analyze(session):
-        if not session.get("market_open", False):
-            return {"region":"WEEKEND / CLOSED","active":False,"overlap":False}
-        name = session.get("session", "")
-        return {"region":name,"active":True,"overlap":"OVERLAP" in name}
-
-
-class BreakEvenEngine:
-    """Calculates a paper-trade break-even trigger; it never modifies broker orders."""
-    @staticmethod
-    def calculate(entry, sl, direction, trigger_rr=1.0, buffer=0.0):
-        if entry is None or sl is None or direction not in ("BUY","SELL"):
-            return {"enabled":False,"trigger":None,"status":"UNAVAILABLE"}
-        risk = abs(float(entry)-float(sl))
-        trigger = float(entry) + risk*trigger_rr + buffer if direction == "BUY" else float(entry) - risk*trigger_rr - buffer
-        return {"enabled":True,"trigger":trigger,"status":"ARMED","trigger_rr":trigger_rr}
-
-
-class SignalExplanationEngine:
-    """Produces explicit, auditable reasons for a final signal or veto."""
-    @staticmethod
-    def explain(a):
-        ens=a.get("ensemble",{}); reasons=[]
-        if a.get("session",{}).get("market_open") is False: reasons.append("Forex market is closed")
-        if a.get("data_quality",{}).get("signal_allowed") is False: reasons.append("Market data is not verified/fresh enough")
-        if ens.get("direction") in ("BULLISH","BEARISH"): reasons.append(f"Final directional stack: {ens['direction']}")
-        if a.get("direct_probability",{}).get("direction") not in (None,"WAIT"): reasons.append(f"Direct probability: {a['direct_probability']['direction']} ({a['direct_probability'].get('confidence',0):.1f}% confidence)")
-        if a.get("volume_flow",{}).get("direction") in ("BULLISH","BEARISH"): reasons.append(f"Volume flow: {a['volume_flow']['direction']}")
-        reasons.extend(ens.get("reasons",[]))
-        return {"summary":"; ".join(dict.fromkeys(reasons)) if reasons else "No verified signal conditions.","reasons":list(dict.fromkeys(reasons))}
-
-
-class RiskVetoEngine:
-    """Final immutable safety gate. Any hard veto forces NO TRADE."""
-    @staticmethod
-    def evaluate(a):
-        veto=[]
-        if not a.get("session",{}).get("market_open",False): veto.append("FOREX MARKET CLOSED")
-        if not a.get("data_quality",{}).get("signal_allowed",False): veto.append("DATA QUALITY / STALE FEED")
-        if not a.get("risk",{}).get("approved",False): veto.append("RISK VETO")
-        if not a.get("no_trade",{}).get("trade_allowed",False): veto.extend(a.get("no_trade",{}).get("reasons",[]))
-        ai=a.get("ai",{}); d=a.get("ensemble",{}).get("direction")
-        cfg = a.get("_config")
-        floor = (
-            getattr(cfg, "daily_ai_conflict_probability", 55.0)
-            if str(a.get("_timeframe","")).upper() == "D1"
-            else getattr(cfg, "ai_conflict_probability", 60.0)
-        )
-        if d=="BULLISH" and ai.get("down_probability",0)>=floor:
-            veto.append(f"AI DOWN PROBABILITY CONFLICT ({ai.get('down_probability',0):.1f}% >= {floor:.1f}%)")
-        if d=="BEARISH" and ai.get("up_probability",0)>=floor:
-            veto.append(f"AI UP PROBABILITY CONFLICT ({ai.get('up_probability',0):.1f}% >= {floor:.1f}%)")
-        return {"veto":bool(veto),"approved":not veto,"reasons":list(dict.fromkeys(veto))}
-
-
-class AnalysisEngine:
-    """Orchestration marker: all analytical engines are consumed before decision."""
-    REQUIRED = ("trend","momentum","volatility","structure","price_action","sr","breakout","liquidity",
-                "regime","session","currency_strength","mtf","economic","cot","correlation",
-                "volume_flow","direct_probability","ai","ensemble","risk","no_trade","trade_quality")
-    @classmethod
-    def audit(cls, analysis):
-        missing=[k for k in cls.REQUIRED if k not in analysis]
-        return {"complete":not missing,"missing":missing,"engine_count":len(cls.REQUIRED)}
-
 def canonical_symbol(symbol: str) -> str:
     """Normalize a dashboard/feed symbol to one canonical key."""
     s = str(symbol or "").upper().strip().replace("/", "").replace("_", "").replace("-", "")
@@ -2659,20 +1981,6 @@ def display_symbol(symbol: str) -> str:
 def _empty_market_data() -> pd.DataFrame:
     """Return a typed empty OHLCV frame. Empty means NO DATA, never synthetic data."""
     return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
-
-
-def _get_fxcm_setting(name: str, default: str = "") -> str:
-    """Resolve FXCM settings without exposing credentials in source code."""
-    value = str(os.getenv(name, "") or "").strip()
-    if value:
-        return value
-    try:
-        value = str(st.secrets.get(name, "") or "").strip()
-        if value:
-            return value
-    except Exception:
-        pass
-    return default
 
 
 def _get_twelve_data_key(cfg: Config) -> str:
@@ -2692,30 +2000,6 @@ def _get_twelve_data_key(cfg: Config) -> str:
             return value
     try:
         value = str(st.secrets.get("TWELVE_DATA_API_KEY", "") or "").strip()
-        if value:
-            return value
-    except Exception:
-        pass
-    return ""
-
-
-def _get_mt5_bridge_setting(name: str, cfg_value: str = "") -> str:
-    """Resolve remote MT5 bridge settings from session, environment, or Streamlit secrets."""
-    value = str(cfg_value or "").strip()
-    if value:
-        return value
-    try:
-        session_key = "mt5_bridge_url" if name == "MT5_BRIDGE_URL" else "mt5_bridge_token"
-        session_value = str(st.session_state.get(session_key, "") or "").strip()
-        if session_value:
-            return session_value
-    except Exception:
-        pass
-    value = str(os.getenv(name, "") or "").strip()
-    if value:
-        return value
-    try:
-        value = str(st.secrets.get(name, "") or "").strip()
         if value:
             return value
     except Exception:
@@ -2804,35 +2088,15 @@ def get_live_pair_data(symbol: str, timeframe: str, cfg: Config, force=False):
     timeframe = str(timeframe).upper()
     requested_source = str(cfg.data_source).upper()
     cache = st.session_state.setdefault("live_pair_cache", {})
-    outputsize = (int(getattr(cfg, "mt5_outputsize", 500)) if requested_source in {"MT5", "MT5 REMOTE"} else int(getattr(cfg, "fxcm_outputsize", 500)) if requested_source == "FXCM" else int(getattr(cfg, "twelve_data_outputsize", 500)))
-    key = (requested_source, symbol, timeframe, outputsize)
+    key = (requested_source, symbol, timeframe, int(getattr(cfg, "twelve_data_outputsize", 500)))
 
     if not force and key in cache:
         cached = cache[key]
         cached_df = cached.get("df")
-        cached_meta = dict(cached.get("meta", {}) or {})
-        cached_at = float(cached.get("cached_at", 0.0) or 0.0)
-        age = time.time() - cached_at if cached_at else float("inf")
-        # MT5 is a live feed: refresh its bars after the configured TTL.
-        # Twelve Data intentionally remains cached unless explicitly refreshed so
-        # rate limits cannot be hit repeatedly by Streamlit reruns.
-        ttl = max(1, int(getattr(cfg, "live_refresh_seconds", 15))) if requested_source in {"MT5", "MT5 REMOTE", "FXCM"} else float("inf")
-        if cached_df is not None and not cached_df.empty and age < ttl:
-            cached_meta["cache_age_seconds"] = max(0.0, age)
-            return cached_df.copy(), cached_meta
+        if cached_df is not None and not cached_df.empty:
+            return cached_df.copy(), dict(cached.get("meta", {}))
 
-    if requested_source == "FXCM":
-        try:
-            df, meta = FXCMLiveDataEngine.candles(
-                symbol, timeframe, int(getattr(cfg, "fxcm_outputsize", 500)),
-                int(getattr(cfg, "fxcm_timeout_seconds", 20))
-            )
-            actual_source = "FXCM"
-        except Exception as fxcm_error:
-            raise RuntimeError(
-                f"FXCM live data unavailable for {display_symbol(symbol)}/{timeframe}: {fxcm_error}"
-            )
-    elif requested_source == "TWELVE DATA":
+    if requested_source == "TWELVE DATA":
         df, meta = _fetch_twelve_data(symbol, timeframe, cfg)
         actual_source = "TWELVE DATA"
     elif requested_source == "MT5":
@@ -2844,19 +2108,18 @@ def get_live_pair_data(symbol: str, timeframe: str, cfg: Config, force=False):
                     "read_only": True, "execution_enabled": False, "tick": tick}
             actual_source = "MT5"
         except Exception as mt5_error:
-            raise RuntimeError(f"MT5 local data unavailable for {symbol}/{timeframe}: {mt5_error}")
-    elif requested_source == "MT5 REMOTE":
-        try:
-            df, meta = RemoteMT5BridgeEngine.snapshot(
-                symbol, timeframe,
-                int(getattr(cfg, "mt5_outputsize", 500)),
-                base_url=str(getattr(cfg, "mt5_bridge_url", "") or ""),
-                token=str(getattr(cfg, "mt5_bridge_token", "") or ""),
-                timeout=int(getattr(cfg, "mt5_bridge_timeout_seconds", 10)),
-            )
-            actual_source = "MT5 REMOTE"
-        except Exception as bridge_error:
-            raise RuntimeError(f"MT5 remote bridge unavailable for {symbol}/{timeframe}: {bridge_error}")
+            # Cloud hosts commonly cannot run a local MT5 terminal. If the user has
+            # explicitly supplied a Twelve Data key, use it as a visible LIVE fallback.
+            # We never fall back to synthetic candles here.
+            td_key = _get_twelve_data_key(cfg)
+            if bool(getattr(cfg, "allow_live_source_failover", True)) and td_key:
+                df, meta = _fetch_twelve_data(symbol, timeframe, cfg)
+                meta["requested_source"] = "MT5"
+                meta["fallback_reason"] = str(mt5_error)
+                meta["source"] = "TWELVE DATA"
+                actual_source = "TWELVE DATA"
+            else:
+                raise RuntimeError(str(mt5_error))
     elif requested_source == "DEMO":
         # DEMO remains an explicit research mode only. Build a base M5 series and
         # resample it so D1 really represents daily candles rather than mislabeled M5 data.
@@ -2881,15 +2144,11 @@ def get_live_pair_data(symbol: str, timeframe: str, cfg: Config, force=False):
     meta = dict(meta or {})
     meta.update({"symbol": symbol, "timeframe": timeframe, "source": actual_source,
                  "requested_source": requested_source})
-    resolved_size = (int(getattr(cfg, "mt5_outputsize", 500)) if actual_source in {"MT5", "MT5 REMOTE"} else int(getattr(cfg, "fxcm_outputsize", 500)) if actual_source == "FXCM" else int(getattr(cfg, "twelve_data_outputsize", 500)))
-    cache_meta = dict(meta)
-    cache_meta["cached_at_utc"] = datetime.now(timezone.utc).isoformat()
-    cache_entry = {"df": df.copy(), "meta": cache_meta, "cached_at": time.time()}
-    cache_key = (actual_source, symbol, timeframe, resolved_size)
-    cache[cache_key] = cache_entry
+    cache_key = (actual_source, symbol, timeframe, int(getattr(cfg, "twelve_data_outputsize", 500)))
+    cache[cache_key] = {"df": df.copy(), "meta": dict(meta)}
     # Also bind the request key to the resolved feed so subsequent reruns use the
     # same exact pair/source rather than resurrecting a prior dataset.
-    cache[key] = {"df": df.copy(), "meta": dict(cache_meta), "cached_at": time.time()}
+    cache[key] = {"df": df.copy(), "meta": dict(meta)}
     return df, meta
 
 
@@ -2900,22 +2159,8 @@ def get_selected_market_data(symbol: str, timeframe: str, cfg: Config):
     requested_source = str(cfg.data_source).upper()
 
     # IMPORTANT: source is part of identity. A source change must trigger a new fetch.
-    # For live MT5/remote MT5, also honor the configured refresh TTL so Streamlit
-    # reruns actually request a fresh snapshot instead of returning the previous
-    # selected dataset forever.
     if data_matches_selection(symbol, timeframe, st.session_state.get("data"), requested_source):
-        if requested_source in {"MT5", "MT5 REMOTE", "FXCM"}:
-            meta = st.session_state.get("data_meta", {}) or {}
-            loaded_at = meta.get("loaded_at")
-            try:
-                loaded_ts = pd.to_datetime(loaded_at, utc=True)
-                age = (pd.Timestamp.now(tz="UTC") - loaded_ts).total_seconds()
-            except Exception:
-                age = float("inf")
-            if age < max(1, int(getattr(cfg, "live_refresh_seconds", 15))):
-                return st.session_state.data, meta
-        else:
-            return st.session_state.data, st.session_state.get("data_meta", {})
+        return st.session_state.data, st.session_state.get("data_meta", {})
 
     # A pair or source change invalidates the old dataset BEFORE fetching.
     clear_market_data_identity(clear_candles=True)
@@ -2990,102 +2235,84 @@ def build_no_data_analysis(symbol, cfg, data_quality=None, reason="NO MARKET DAT
 
 
 def analyze_market(df, symbol, cfg, timeframe=None):
-    """Run V13 as one dependency-checked analysis graph."""
-    tf = str(timeframe or st.session_state.get("data_timeframe", "M5") or "M5").upper()
-    x = MarketDataEngine.normalize(df)
-    if x.empty:
-        raise RuntimeError(f"No verified candles available for {canonical_symbol(symbol)}/{tf}")
-
-    t = TrendEngine.analyze(x); m = MomentumEngine.analyze(x); v = VolatilityEngine.analyze(x)
-    s = StructureEngine.analyze(x); pa = PriceActionEngine.analyze(x); sr = SupportResistanceEngine.analyze(x)
-    bo = BreakoutEngine.analyze(x); li = LiquidityEngine.analyze(x)
+    t = TrendEngine.analyze(df)
+    m = MomentumEngine.analyze(df)
+    v = VolatilityEngine.analyze(df)
+    s = StructureEngine.analyze(df)
+    pa = PriceActionEngine.analyze(df)
+    sr = SupportResistanceEngine.analyze(df)
+    bo = BreakoutEngine.analyze(df)
+    li = LiquidityEngine.analyze(df)
     re = RegimeEngine.classify(t, v, s, bo)
-    se = SessionEngine.analyze()
-    cs = CurrencyStrengthEngine.analyze(x, symbol)
-    mtf = MultiTimeframeEngine.analyze(x, symbol=symbol, cfg=cfg)
+    se = SessionEngine.analyze(df.time.iloc[-1])
+    cs = CurrencyStrengthEngine.analyze(df, symbol)
+    mtf = MultiTimeframeEngine.analyze(df)
     eco = EconomicEngine.analyze(load_events(), symbol)
     cot = COTEngine.analyze(load_cot(), symbol)
-    corr = CorrelationEngine.analyze({symbol: x}, symbol)
-    adv_m = MomentumDirectionEngine.analyze(x)
-    volume_flow = VolumeFlowEngine.analyze(x)
-    fvg = analyze_fair_value_gap(x)
-    technical = TechnicalAnalysisEngine.analyze(t, m, v, s, pa)
-    c = ConfluenceEngine.score(t, m, v, s, pa, sr, bo, li, re, se, mtf, eco, cot)
-    dq = DataIntegrityEngine.assess(x, tf, cfg.data_max_age_seconds)
 
-    advisory = {
-        "trend":t,"momentum":m,"volatility":v,"structure":s,"price_action":pa,"sr":sr,
-        "breakout":bo,"liquidity":li,"regime":re,"session":se,"mtf":mtf,"economic":eco,
-        "cot":cot,"correlation":corr,"advanced_momentum":adv_m,"volume_flow":volume_flow,
-        "fvg":fvg,"currency_strength":cs,
-    }
-    direct_probability = DirectProbabilityEngine.calculate(advisory)
-    ai = AIProbabilityEngine.predict(x, horizon=1)
-    risk = RiskEngine.evaluate({
-        "daily_loss_pct":0,"drawdown_pct":0,
-        "open_positions":len([z for z in st.session_state.journal if z.get("status")=="OPEN"])
-    }, cfg, c, v, eco, corr)
-    advisory.update({"confluence":c,"risk":risk,"ai":ai,"direct_probability":direct_probability,
-                     "technical_analysis":technical,"data_quality":dq,
-                     "_timeframe":tf,"_config":cfg})
-    ensemble = EnsembleDecisionEngine.decide(advisory, ai, dq, cfg)
-    ai_confluence = AIConfluenceEngine.calculate(
-        ai, ensemble.get("direction", "WAIT"),
-        cfg.daily_ai_conflict_probability if tf == "D1" else cfg.ai_conflict_probability
+    # Single-symbol correlation is LOW by definition unless peer histories are supplied.
+    history = {symbol: df}
+    corr = CorrelationEngine.analyze(history, symbol)
+
+    c = ConfluenceEngine.score(
+        t, m, v, s, pa, sr, bo, li, re, se, mtf, eco, cot
     )
+    dq = DataIntegrityEngine.assess(df, timeframe or st.session_state.get("data_timeframe", "M5") or "M5", cfg.data_max_age_seconds)
+    adv_m = MomentumDirectionEngine.analyze(df)
+    ai = AIProbabilityEngine.predict(df)
+
+    risk = RiskEngine.evaluate(
+        {
+            "daily_loss_pct": 0,
+            "drawdown_pct": 0,
+            "open_positions": len(
+                [x for x in st.session_state.journal if x.get("status") == "OPEN"]
+            ),
+        },
+        cfg,
+        c,
+        v,
+        eco,
+        corr,
+    )
+    # Advanced layers are advisory gates; they do not replace V12.1 engines.
+    advisory = {"trend":t,"momentum":m,"volatility":v,"structure":s,"price_action":pa,"sr":sr,
+                "breakout":bo,"liquidity":li,"regime":re,"session":se,"mtf":mtf,"economic":eco,
+                "cot":cot,"correlation":corr,"confluence":c,"risk":risk}
+    advisory["advanced_momentum"] = adv_m
+    advisory["ai"] = ai
+    ensemble = EnsembleDecisionEngine.decide(advisory, ai, dq, cfg)
     no_trade = NoTradeEngine.evaluate(advisory, ensemble, dq, cfg)
     quality = TradeQualityEngine.evaluate(advisory, ensemble, no_trade, dq)
-    advisory.update({"ensemble":ensemble,"no_trade":no_trade,"trade_quality":quality})
 
-    timing = CandleTimingEngine.assess(x, tf, se)
-    signal_timing = SignalTimingEngine.assess(st.session_state.get("last_signal_time"), cfg.signal_max_age_seconds)
-    region = MarketRegionEngine.analyze(se)
-    result = {
-        "trend":t,"momentum":m,"volatility":v,"structure":s,"price_action":pa,"sr":sr,"breakout":bo,
-        "liquidity":li,"regime":re,"session":se,"currency_strength":cs,"mtf":mtf,"economic":eco,
-        "cot":cot,"correlation":corr,"technical_analysis":technical,"confluence":c,"risk":risk,"advanced_momentum":adv_m,
-        "volume_flow":volume_flow,"fvg":fvg,"direct_probability":direct_probability,
-        "candle_timing":timing,"signal_timing":signal_timing,"market_region":region,"ai":ai,
-        "ai_confluence":ai_confluence,"ensemble":ensemble,
-        "no_trade":no_trade,"trade_quality":quality,"data_quality":dq,
-        "_timeframe":tf,"_config":cfg,
-        "t":t,"m":m,"v":v,"s":s,"pa":pa,"bo":bo,"li":li,"re":re,"se":se,"cs":cs,"eco":eco,"corr":corr,"c":c,
+    return {
+        "trend": t,
+        "momentum": m,
+        "volatility": v,
+        "structure": s,
+        "price_action": pa,
+        "sr": sr,
+        "breakout": bo,
+        "liquidity": li,
+        "regime": re,
+        "session": se,
+        "currency_strength": cs,
+        "mtf": mtf,
+        "economic": eco,
+        "cot": cot,
+        "correlation": corr,
+        "confluence": c,
+        "risk": risk,
+        "advanced_momentum": adv_m,
+        "ai": ai,
+        "ensemble": ensemble,
+        "no_trade": no_trade,
+        "trade_quality": quality,
+        "data_quality": dq,
+        # Compatibility aliases used by earlier V12.1 code.
+        "t": t, "m": m, "v": v, "s": s, "pa": pa, "bo": bo, "li": li,
+        "re": re, "se": se, "cs": cs, "eco": eco, "corr": corr, "c": c,
     }
-    # Market tracker is the same ranking engine used by the scanner, now
-    # exercised for the selected symbol so health verification covers it too.
-    try:
-        result["market_tracker"] = MarketTrackerEngine.rank([canonical_symbol(symbol)], {canonical_symbol(symbol): result})
-    except Exception as tracker_ex:
-        result["market_tracker"] = {"status": "FAILED", "error": str(tracker_ex)}
-    result["analysis_audit"] = AnalysisEngine.audit(result)
-    result["break_even"] = BreakEvenEngine.calculate(None, None, "WAIT")
-    result["signal_explanation"] = SignalExplanationEngine.explain(result)
-
-    veto = RiskVetoEngine.evaluate(result)
-    result["risk_veto"] = veto
-    if veto["veto"]:
-        ensemble["approved"] = False
-        ensemble["direction"] = "WAIT"
-        ensemble["reasons"] = list(dict.fromkeys(list(ensemble.get("reasons",[])) + veto["reasons"]))
-        no_trade["trade_allowed"] = False
-        no_trade["status"] = "NO TRADE"
-        no_trade["reasons"] = list(dict.fromkeys(list(no_trade.get("reasons",[])) + veto["reasons"]))
-        quality["decision"] = "NO TRADE"
-
-    result["signal_explanation"] = SignalExplanationEngine.explain(result)
-    result["engine_health"] = health_layer.audit_analysis(result)
-    if result["engine_health"]["trade_veto"]:
-        ensemble["approved"] = False
-        ensemble["direction"] = "WAIT"
-        no_trade["trade_allowed"] = False
-        no_trade["status"] = "NO TRADE"
-        no_trade["reasons"] = list(dict.fromkeys(
-            list(no_trade.get("reasons",[])) +
-            [f"ENGINE HEALTH FAILURE: {n}" for n in result["engine_health"]["failed_critical"]]
-        ))
-        quality["decision"] = "NO TRADE"
-    result["signal_explanation"] = SignalExplanationEngine.explain(result)
-    return result
 
 
 def fmt(v, n=2):
@@ -3099,78 +2326,6 @@ def fmt(v, n=2):
 # DASHBOARD
 # ============================================================
 
-
-
-# ============================================================
-# V13 ADDITION: REMOTE MT5 BRIDGE CLIENT (READ-ONLY)
-# ============================================================
-class RemoteMT5BridgeEngine:
-    """Read-only HTTP client for a Windows-hosted MT5 bridge.
-
-    The Streamlit app does not attempt to run MetaTrader 5 itself. It requests
-    exact pair/timeframe snapshots from the remote bridge, validates the
-    response identity, and converts the returned OHLCV records into the same
-    MarketDataEngine schema used by every existing V13 engine.
-    """
-
-    @staticmethod
-    def _headers(token):
-        if not token:
-            raise RuntimeError("MT5 remote bridge token is not configured.")
-        return {"Authorization": f"Bearer {token}", "X-Bridge-Token": token, "Accept": "application/json"}
-
-    @staticmethod
-    def snapshot(symbol, timeframe, limit, base_url, token, timeout=10):
-        try:
-            import requests
-        except ImportError as ex:
-            raise RuntimeError(f"requests package is required for the remote MT5 bridge: {ex}")
-        base_url = str(base_url or "").strip().rstrip("/")
-        if not base_url:
-            raise RuntimeError("MT5 remote bridge URL is not configured.")
-        url = f"{base_url}/v1/snapshot"
-        requested = canonical_symbol(symbol)
-        tf = str(timeframe).upper()
-        params = {"symbol": requested, "timeframe": tf, "limit": int(limit)}
-        try:
-            response = requests.get(url, params=params, headers=RemoteMT5BridgeEngine._headers(token), timeout=int(timeout))
-        except Exception as ex:
-            raise RuntimeError(f"Bridge request failed: {ex}")
-        if response.status_code != 200:
-            detail = response.text[:500]
-            raise RuntimeError(f"Bridge HTTP {response.status_code}: {detail}")
-        try:
-            payload = response.json()
-        except Exception as ex:
-            raise RuntimeError(f"Bridge returned invalid JSON: {ex}")
-        if not payload.get("ok"):
-            raise RuntimeError(str(payload.get("error") or "Bridge returned ok=false"))
-        returned_pair = canonical_symbol(payload.get("requested_symbol") or payload.get("symbol") or "")
-        if returned_pair != requested:
-            raise RuntimeError(f"Bridge pair mismatch: requested {requested}, returned {returned_pair or 'NONE'}")
-        returned_tf = str(payload.get("timeframe") or "").upper()
-        if returned_tf != tf:
-            raise RuntimeError(f"Bridge timeframe mismatch: requested {tf}, returned {returned_tf or 'NONE'}")
-        rows = payload.get("bars") or []
-        if not rows:
-            raise RuntimeError(f"Bridge returned no candles for {display_symbol(symbol)}/{tf}")
-        df = MarketDataEngine.normalize(pd.DataFrame(rows))
-        if df.empty:
-            raise RuntimeError(f"Bridge returned unusable candles for {display_symbol(symbol)}/{tf}")
-        meta = {
-            "source": "MT5 REMOTE",
-            "requested_source": "MT5 REMOTE",
-            "symbol": requested,
-            "requested_symbol": requested,
-            "mt5_symbol": payload.get("mt5_symbol", requested),
-            "timeframe": tf,
-            "read_only": True,
-            "execution_enabled": False,
-            "tick": payload.get("tick"),
-            "bridge_url": base_url,
-            "bridge_server_time": payload.get("server_time"),
-        }
-        return df, meta
 
 
 # ============================================================
@@ -3248,42 +2403,39 @@ def _daily_analysis_config(cfg: Config) -> Config:
     return replace(cfg, data_max_age_seconds=max(int(cfg.data_max_age_seconds), 432000))
 
 
-def prepare_completed_daily_candles(df: pd.DataFrame) -> tuple[pd.DataFrame, Dict[str, Any]]:
-    """Keep only completed, non-weekend D1 bars for higher-timeframe analysis."""
-    x = MarketDataEngine.normalize(df)
-    if x.empty:
-        return x, {"status": "NO DATA", "removed": 0, "reason": "EMPTY D1 FEED"}
-    now = pd.Timestamp.now(tz="UTC")
-    original = len(x)
-    mask = x["time"].dt.date < now.date()
-    mask &= ~x["time"].dt.weekday.isin([5, 6])
-    completed = x.loc[mask].copy().reset_index(drop=True)
-    removed = original - len(completed)
-    if completed.empty:
-        return completed, {
-            "status": "NO COMPLETED D1", "removed": removed,
-            "reason": "No completed non-weekend daily candle is available yet.",
-        }
-    return completed, {
-        "status": "COMPLETED", "removed": removed,
-        "last_completed_candle": pd.Timestamp(completed["time"].iloc[-1]).isoformat(),
-        "source_rows": original, "analysis_rows": len(completed),
-    }
-
-
 def get_daily_market_data(symbol: str, cfg: Config, force: bool = False):
-    """Fetch exact D1 data, then remove incomplete/current/weekend bars."""
-    raw, meta = get_live_pair_data(canonical_symbol(symbol), "D1", cfg, force=force)
-    completed, status = prepare_completed_daily_candles(raw)
-    meta = dict(meta or {})
-    meta["daily_candle_filter"] = status
-    meta["analysis_candle_status"] = "COMPLETED" if not completed.empty else "UNAVAILABLE"
-    return completed, meta
+    """Fetch the exact selected pair on D1 for the upfront daily outlook."""
+    return get_live_pair_data(canonical_symbol(symbol), "D1", cfg, force=force)
 
 
 def analyze_daily_market(df: pd.DataFrame, symbol: str, cfg: Config):
-    """Run the full V13 analysis stack only on completed D1 candles."""
-    return analyze_market(df, canonical_symbol(symbol), _daily_analysis_config(cfg), "D1")
+    """Run the existing full V13 analysis stack on completed D1 candles only."""
+    completed = DailySignalAssessmentEngine.completed_d1(df)
+    if completed.empty:
+        raise RuntimeError("No completed D1 candle is available for daily signal assessment.")
+    return analyze_market(completed, canonical_symbol(symbol), _daily_analysis_config(cfg), "D1")
+
+
+def get_locked_daily_signal(symbol: str, cfg: Config, force: bool = False):
+    """Return one validated Daily Signal for the current UTC day.
+
+    Intraday reruns reuse the locked result. A new daily cycle is the only normal
+    event that causes a fresh D1 assessment. Force is reserved for explicit
+    operator revalidation after a data/source change.
+    """
+    cycle = datetime.now(timezone.utc).date().isoformat()
+    key = f"{canonical_symbol(symbol)}|{cycle}|{str(cfg.data_source).upper()}"
+    cache = st.session_state.setdefault("daily_signal_cache", {})
+    if not force and key in cache:
+        return cache[key]
+    daily_df, daily_meta = get_daily_market_data(symbol, cfg, force=force)
+    report = DailySignalAssessmentEngine.evaluate(daily_df, symbol, cfg)
+    report["source"] = str(daily_meta.get("source", cfg.data_source)).upper()
+    report["symbol"] = canonical_symbol(symbol)
+    if report.get("locked"):
+        cache[key] = report
+        st.session_state["daily_signal_locked"] = report
+    return report
 
 
 
@@ -3323,10 +2475,8 @@ def init_state():
         "td_key": "",
         "mt5_path": "",
         "mt5_connected": False,
-        "mt5_remote_connected": False,
-        "mt5_refresh_seconds": 15,
-        "mt5_bridge_url": "",
-        "mt5_bridge_token": "",
+        "daily_signal_cache": {},
+        "daily_signal_locked": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -3350,7 +2500,7 @@ def dashboard():
     init_state()
 
     cfg = Config()
-    st.title("V13 AI Trading Platform · MT5 Remote Bridge")
+    st.title("V13 AI Trading Platform · V12.1 Protected Baseline")
     st.caption(
         "Forex + Binary research, paper trading, market intelligence, "
         "risk control and backtesting terminal"
@@ -3394,107 +2544,16 @@ def dashboard():
         st.divider()
         st.write("**Live Data (read-only)**")
         configured_td_key = _get_twelve_data_key(cfg)
-        # Remote MT5 is the primary cloud-compatible live source. Local MT5 is
-        # retained for users running Streamlit on the same Windows machine.
-        source_options = ["TWELVE DATA", "MT5 REMOTE", "MT5", "FXCM", "DEMO"]
-        default_source_index = source_options.index(cfg.data_source) if cfg.data_source in source_options else 0
+        source_options = ["DEMO", "TWELVE DATA", "MT5"]
+        default_source_index = 1 if configured_td_key else 0
         data_source = st.selectbox("Data source", source_options, index=default_source_index)
         cfg.data_source = data_source
-        cfg.allow_live_source_failover = False
-        if data_source == "MT5 REMOTE":
-            st.caption("MT5 REMOTE is the recommended Streamlit Cloud mode: the MT5 terminal stays on a Windows PC/VPS and V13 reads it through the secure bridge.")
-            bridge_url_default = _get_mt5_bridge_setting("MT5_BRIDGE_URL", st.session_state.get("mt5_bridge_url", ""))
-            bridge_token_default = _get_mt5_bridge_setting("MT5_BRIDGE_TOKEN", st.session_state.get("mt5_bridge_token", ""))
-            cfg.mt5_bridge_url = st.text_input(
-                "MT5 bridge URL",
-                value=bridge_url_default,
-                placeholder="https://your-secure-bridge.example.com",
-                help="HTTPS URL of the Windows MT5 bridge. Do not paste a local 127.0.0.1 URL when V13 is on Streamlit Cloud.",
-            ).strip().rstrip("/")
-            st.session_state.mt5_bridge_url = cfg.mt5_bridge_url
-            cfg.mt5_bridge_token = st.text_input(
-                "MT5 bridge token", type="password",
-                value=bridge_token_default,
-                help="Use the same bearer token configured on the Windows MT5 bridge.",
-            )
-            st.session_state.mt5_bridge_token = cfg.mt5_bridge_token
-            cfg.mt5_outputsize = st.number_input("MT5 historical candles", 200, 5000, 500, 100, key="remote_mt5_outputsize")
-            cfg.live_refresh_seconds = st.number_input("Remote MT5 refresh interval (seconds)", 5, 300, 15, 5, key="remote_mt5_refresh_seconds")
-            cfg.mt5_bridge_timeout_seconds = st.number_input("Bridge request timeout (seconds)", 3, 60, 10, 1, key="mt5_bridge_timeout")
-            auto_refresh = st.checkbox("Auto-refresh remote MT5 data", value=True, key="remote_mt5_auto_refresh")
-            if auto_refresh:
-                try:
-                    from streamlit_autorefresh import st_autorefresh
-                    st_autorefresh(interval=int(cfg.live_refresh_seconds) * 1000, key="v13_remote_mt5_refresh")
-                except Exception:
-                    st.caption("Install streamlit-autorefresh to enable automatic remote refresh; the manual refresh button remains available.")
-            if st.button("🟢 Test / Refresh Remote MT5", use_container_width=True):
-                try:
-                    live_df, meta = RemoteMT5BridgeEngine.snapshot(symbol, timeframe, cfg.mt5_outputsize, cfg.mt5_bridge_url, cfg.mt5_bridge_token, cfg.mt5_bridge_timeout_seconds)
-                    live_df, meta = store_market_data(symbol, timeframe, live_df, meta, "MT5 REMOTE")
-                    st.session_state.mt5_remote_connected = True
-                    st.session_state.live_status = LiveConnectionManager.status("MT5 REMOTE", live_df, MarketDataEngine.validate(live_df), DataIntegrityEngine.assess(live_df, timeframe, cfg.data_max_age_seconds), meta)
-                    tick = meta.get("tick") or {}
-                    if tick:
-                        st.success(f"Remote MT5 LIVE: {display_symbol(symbol)} · {timeframe} · Bid {tick.get('bid')} · Ask {tick.get('ask')} · {len(live_df):,} candles.")
-                    else:
-                        st.success(f"Remote MT5 connected: {len(live_df):,} candles loaded for {display_symbol(symbol)} · {timeframe}.")
-                except Exception as ex:
-                    st.session_state.mt5_remote_connected = False
-                    st.session_state.live_status = {"source":"MT5 REMOTE","connected":False,"read_only":True,"execution_enabled":False,"error":str(ex)}
-                    st.error(f"Remote MT5 bridge error: {ex}")
-        elif data_source == "FXCM":
-            st.caption("FXCM LIVE is read-only. No FXCM order endpoint is used.")
-            fxcm_env = _get_fxcm_setting("FXCM_ENVIRONMENT", "demo").lower()
-            st.info(
-                f"FXCM environment: {fxcm_env.upper()} · "
-                f"Login configured: {'YES' if _get_fxcm_setting('FXCM_LOGIN_ID') else 'NO'}"
-            )
-            cfg.fxcm_outputsize = st.number_input(
-                "FXCM historical candles", 200, 5000, 500, 100, key="fxcm_outputsize"
-            )
-            cfg.fxcm_timeout_seconds = st.number_input(
-                "FXCM request timeout (seconds)", 5, 60, 20, 5, key="fxcm_timeout_seconds"
-            )
-            auto_refresh = st.checkbox("Auto-refresh FXCM data", value=True, key="fxcm_auto_refresh")
-            if auto_refresh:
-                try:
-                    from streamlit_autorefresh import st_autorefresh
-                    st_autorefresh(
-                        interval=int(cfg.live_refresh_seconds) * 1000,
-                        key="v13_fxcm_refresh"
-                    )
-                except Exception:
-                    st.caption(
-                        "Install streamlit-autorefresh for automatic FXCM refresh; "
-                        "the manual refresh button remains available."
-                    )
-            if st.button("🟢 Connect / Refresh FXCM Live Data", use_container_width=True):
-                try:
-                    live_df, meta = FXCMLiveDataEngine.candles(
-                        symbol, timeframe, cfg.fxcm_outputsize, cfg.fxcm_timeout_seconds
-                    )
-                    live_df, meta = store_market_data(symbol, timeframe, live_df, meta, "FXCM")
-                    st.session_state.live_status = LiveConnectionManager.status(
-                        "FXCM", live_df, MarketDataEngine.validate(live_df),
-                        DataIntegrityEngine.assess(
-                            live_df, timeframe, cfg.data_max_age_seconds
-                        ), meta
-                    )
-                    tick = meta.get("tick") or {}
-                    st.success(
-                        f"FXCM LIVE: {display_symbol(symbol)} · {timeframe} · "
-                        f"Bid {tick.get('bid')} · Ask {tick.get('ask')} · "
-                        f"{len(live_df):,} candles loaded."
-                    )
-                except Exception as ex:
-                    st.session_state.live_status = {
-                        "source":"FXCM","connected":False,"read_only":True,
-                        "execution_enabled":False,"error":str(ex)
-                    }
-                    st.error(f"FXCM error: {ex}")
-        elif data_source == "TWELVE DATA":
-
+        cfg.allow_live_source_failover = st.checkbox(
+            "Allow LIVE source failover (MT5 ↔ Twelve Data)",
+            value=True,
+            help="Only live currency-pair feeds may fail over. Synthetic DEMO data is never used as a live fallback."
+        )
+        if data_source == "TWELVE DATA":
             cfg.twelve_data_api_key = st.text_input("Twelve Data API key", type="password", value=st.session_state.get("td_key", configured_td_key))
             st.session_state.td_key = cfg.twelve_data_api_key
             cfg.twelve_data_outputsize = st.number_input("Historical candles", 200, 5000, 500, 100)
@@ -3512,10 +2571,6 @@ def dashboard():
             mt5_terminal_path = st.text_input("MT5 terminal path (optional)", value=st.session_state.get("mt5_path", ""), help="Leave blank when the default MT5 terminal is installed.")
             st.session_state.mt5_path = mt5_terminal_path
             cfg.mt5_outputsize = st.number_input("MT5 historical candles", 200, 5000, 500, 100, key="mt5_outputsize")
-            cfg.live_refresh_seconds = st.number_input(
-                "MT5 bar refresh interval (seconds)", 5, 300, 15, 5, key="mt5_refresh_seconds"
-            )
-            st.caption("MT5-FIRST: no Twelve Data fallback is used if MT5 fails. The bot fails closed rather than changing data source.")
             if st.button("🟢 Connect / Refresh MT5 Live Data", use_container_width=True):
                 try:
                     MT5LiveDataEngine.connect(symbol, path=mt5_terminal_path or None)
@@ -3569,7 +2624,7 @@ def dashboard():
     else:
         st.info(
             f"{cfg.data_source} mode active. Primary pair/timeframe: {display_symbol(symbol)} · {timeframe}. "
-            "In MT5-first mode, the selected pair/timeframe is fetched directly from MT5; no other pair or data source is substituted."
+            "In live modes, the selected pair is fetched directly; no other pair is substituted."
         )
 
     # Pair/data synchronization gate: the dataframe must belong to the exact selected pair/timeframe.
@@ -3583,24 +2638,18 @@ def dashboard():
             "execution_enabled": False, "error": str(ex)
         }
         st.error(f"Market data error for {display_symbol(symbol)}/{timeframe}: {ex}")
-        if str(cfg.data_source).upper() == "MT5":
-            st.warning(
-                "MT5 is the authoritative live source in this V13 build. MT5 is currently unavailable, "
-                "so live analysis is blocked. Twelve Data is NOT used as an automatic fallback and synthetic "
-                "candles are never substituted for MT5 live data. Select Twelve Data manually only if you "
-                "intentionally want to switch sources."
-            )
+        if str(cfg.data_source).upper() == "MT5" and mt5 is None:
+            if _get_twelve_data_key(cfg):
+                st.warning("MT5 is unavailable in this environment. A Twelve Data key is configured, so enable LIVE source failover or select Twelve Data to read the selected currency pair.")
+            else:
+                st.warning("MT5 is unavailable in this environment. For Streamlit Cloud, select Twelve Data and provide your Twelve Data API key. No synthetic candles will be substituted for live forex data.")
         df = _empty_market_data()
         resolved_meta = {}
 
     if cfg.data_source == "MT5" and st.session_state.get("mt5_connected") and not df.empty:
         tick = MT5LiveDataEngine.tick(symbol)
         if tick:
-            st.info(f"🟢 MT5 LOCAL LIVE · {display_symbol(symbol)} · Bid {tick['bid']} · Ask {tick['ask']} · Spread {tick['spread']}")
-    elif cfg.data_source == "MT5 REMOTE" and not df.empty:
-        tick = (st.session_state.get("data_meta", {}) or {}).get("tick") or {}
-        if tick:
-            st.info(f"🟢 MT5 REMOTE LIVE · {display_symbol(symbol)} · Bid {tick.get('bid')} · Ask {tick.get('ask')} · Spread {tick.get('spread')} · Bridge verified")
+            st.info(f"🟢 MT5 LIVE · {display_symbol(symbol)} · Bid {tick['bid']} · Ask {tick['ask']} · Spread {tick['spread']}")
     validation = MarketDataEngine.validate(df) if not df.empty else {
         "rows": 0, "data_ok": False, "duplicates_removed": 0,
         "missing_ohlc": 0, "large_gaps": 0, "timezone": "UTC"
@@ -3625,7 +2674,7 @@ def dashboard():
     st.session_state.live_status = LiveConnectionManager.status(
         resolved_source, df, validation, data_quality, st.session_state.get("data_meta", {})
     )
-    if st.session_state.get("data_meta", {}).get("fallback_reason") and str(cfg.data_source).upper() != "MT5":
+    if st.session_state.get("data_meta", {}).get("fallback_reason"):
         st.warning(
             f"LIVE source fallback active: requested {cfg.data_source}, loaded {resolved_source}. "
             f"Reason: {st.session_state.data_meta.get('fallback_reason')}"
@@ -3648,111 +2697,62 @@ def dashboard():
         st.error(f"⛔ DATA SYNC BLOCKED · Dashboard {display_symbol(selected_symbol)}/{timeframe} does not match loaded data {display_symbol(loaded_symbol or 'NONE')}/{loaded_tf or 'NONE'} · Source {loaded_source or 'NONE'}")
 
     # ========================================================
-    # DAILY MARKET OUTLOOK — runs before the intraday dashboard
+    # DAILY MARKET SIGNAL — validated once per UTC day, then locked
     # ========================================================
-    st.subheader(f"🌅 Daily Market Outlook · {display_symbol(symbol)}")
-    daily_df = _empty_market_data()
-    daily_a = None
-    daily_meta = {}
+    st.subheader(f"🌅 Daily Market Signal · {display_symbol(symbol)}")
+    daily_report = None
     try:
-        daily_df, daily_meta = get_daily_market_data(symbol, cfg)
-        if daily_df is None or daily_df.empty:
-            raise RuntimeError("No D1 candles returned for the selected pair.")
-        daily_a = analyze_daily_market(daily_df, symbol, cfg)
+        daily_report = get_locked_daily_signal(symbol, cfg)
     except Exception as daily_ex:
-        st.warning(
-            f"Daily outlook unavailable for {display_symbol(symbol)}: {daily_ex}. "
-            "No substitute pair is used."
-        )
+        st.warning(f"Daily signal unavailable for {display_symbol(symbol)}: {daily_ex}")
 
-    if daily_df is not None and not daily_df.empty and daily_a:
-        daily_c = daily_a.get("c", {}) or {}
-        daily_t = daily_a.get("t", {}) or {}
-        daily_m = daily_a.get("m", {}) or {}
-        daily_ai = daily_a.get("ai", {}) or {}
-        daily_ensemble = daily_a.get("ensemble", {}) or {}
-        daily_direction = str(daily_ensemble.get("direction", "WAIT")).upper()
-        daily_score = float(daily_ensemble.get("confidence", 0.0) or 0.0)
-        daily_conflict = bool(daily_ensemble.get("ai_conflict", False))
-        daily_trend = str(daily_t.get("label", "-"))
-        daily_momentum = str(daily_m.get("direction", "-"))
-        daily_regime = str(daily_a.get("re", "-"))
-        daily_up = float(daily_ai.get("up_probability", 0.0) or 0.0)
-        daily_down = float(daily_ai.get("down_probability", 0.0) or 0.0)
-        daily_quality = DataIntegrityEngine.assess(
-            daily_df, "D1", max(int(cfg.data_max_age_seconds), 432000)
-        )
+    if daily_report:
+        ds1, ds2, ds3, ds4, ds5 = st.columns(5)
+        ds1.metric("DAILY SIGNAL", daily_report.get("signal", "WAIT"))
+        ds2.metric("Status", daily_report.get("status", "UNCONFIRMED"))
+        ds3.metric("Engine Agreement", f"{daily_report.get('engine_agreement', 0):.1f}%")
+        ds4.metric("Confidence", f"{daily_report.get('confidence', 0):.1f}%")
+        ds5.metric("Engine Health", f"{daily_report.get('engine_health', {}).get('percent', 0):.1f}%")
+        ds6, ds7, ds8, ds9 = st.columns(4)
+        ds6.metric("AI Daily UP", f"{daily_report.get('ai_up', 0):.1f}%")
+        ds7.metric("AI Daily DOWN", f"{daily_report.get('ai_down', 0):.1f}%")
+        ds8.metric("D1 Candle", str(daily_report.get('completed_candle', '-')).replace('+00:00',' UTC'))
+        ds9.metric("Cycle", daily_report.get('cycle_utc', '-'))
 
-        d1, d2, d3, d4, d5 = st.columns(5)
-        d1.metric("Daily Bias", daily_direction)
-        d2.metric("Daily Score", f"{daily_score:.1f}/100")
-        d3.metric("Trend", daily_trend)
-        d4.metric("Momentum", daily_momentum)
-        d5.metric("Regime", daily_regime)
-        d6, d7, d8 = st.columns(3)
-        d6.metric("AI Daily UP", f"{daily_up:.1f}%")
-        d7.metric("AI Daily DOWN", f"{daily_down:.1f}%")
-        d8.metric("D1 Candles", f"{len(daily_df):,}")
-
-        daily_source = str(daily_meta.get("source", cfg.data_source)).upper()
-        daily_filter = daily_meta.get("daily_candle_filter", {}) or {}
+        dq = daily_report.get('data_quality', {})
         st.caption(
-            f"Daily source: {daily_source} · {display_symbol(symbol)}/D1 · "
-            f"Last COMPLETED candle: {daily_df['time'].iloc[-1]} UTC · "
-            f"Age: {daily_quality.get('age_seconds', 0):.0f}s · Quality: {daily_quality.get('status', 'UNKNOWN')} · "
-            f"Candle status: {daily_meta.get('analysis_candle_status','UNKNOWN')} · "
-            f"Removed incomplete/weekend bars: {daily_filter.get('removed', 0)}"
+            f"Daily source: {daily_report.get('source', cfg.data_source)} · "
+            f"{display_symbol(symbol)}/D1 · COMPLETED CANDLE ONLY · "
+            f"Data quality: {dq.get('status','UNKNOWN')} ({dq.get('score',0):.0f}/100) · "
+            f"Signal is locked for the UTC day once validated."
         )
-        close = float(daily_df["close"].iloc[-1])
-        high20 = float(daily_df["high"].tail(20).max())
-        low20 = float(daily_df["low"].tail(20).min())
-        dc1, dc2, dc3 = st.columns(3)
-        dc1.metric("Daily Close", fmt(close, 5))
-        dc2.metric("20-Day High", fmt(high20, 5))
-        dc3.metric("20-Day Low", fmt(low20, 5))
-
-        daily_market_open = bool((daily_a.get("session", {}) or {}).get("market_open", False))
-        if not daily_market_open:
-            st.warning(
-                f"Daily planning bias: MARKET CLOSED · Technical trend remains {daily_trend}, "
-                "but the final daily decision is WAIT. No new signal is permitted while Forex is closed."
-            )
-        elif daily_conflict:
-            st.warning(
-                f"Daily planning bias: WAIT / AI CONFLICT · Technical trend is {daily_trend}, "
-                f"while AI predicts {daily_up:.1f}% UP vs {daily_down:.1f}% DOWN. "
-                "The conflict must resolve before a directional bias is accepted."
-            )
-        elif daily_direction == "WAIT":
-            st.info(
-                "Daily planning bias: WAIT. The daily engines do not show enough agreement "
-                "to force a directional view. Let the intraday timeframe confirm before considering a setup."
+        if daily_report.get('status') == 'LOCKED':
+            st.success(
+                f"🔒 DAILY SIGNAL LOCKED: {daily_report.get('signal')} · "
+                "Intraday refreshes cannot rewrite this Daily Signal. "
+                "M5/M15/H1 engines may independently return BUY, SELL or WAIT."
             )
         else:
-            st.info(
-                f"Daily planning bias: {daily_direction}. The D1 analysis is the higher-timeframe context; "
-                "the selected intraday timeframe must still confirm before any setup is considered. "
-                "This is research analysis, not a guaranteed forecast."
+            st.warning(
+                "⚠️ DAILY SIGNAL UNCONFIRMED — no directional daily signal is locked. "
+                + ("; ".join(daily_report.get('reasons', [])) or "Insufficient validated consensus.")
             )
-        with st.expander("View full Daily Engine Analysis", expanded=False):
+
+        with st.expander("View complete Daily Engine Assessment", expanded=False):
             st.json({
-                "Trend": daily_a.get("trend"),
-                "Momentum": daily_a.get("momentum"),
-                "Volatility": daily_a.get("volatility"),
-                "Structure": daily_a.get("structure"),
-                "Price Action": daily_a.get("price_action"),
-                "Support/Resistance": daily_a.get("sr"),
-                "Breakout": daily_a.get("breakout"),
-                "Regime": daily_a.get("regime"),
-                "Confluence": daily_a.get("confluence"),
-                "AI": daily_a.get("ai"),
-                "No Trade": daily_a.get("no_trade"),
-                "Trade Quality": daily_a.get("trade_quality"),
+                "Daily Signal": daily_report.get('signal'),
+                "Status": daily_report.get('status'),
+                "Engine Agreement": daily_report.get('engine_agreement'),
+                "AI": {"UP": daily_report.get('ai_up'), "DOWN": daily_report.get('ai_down'), "Direction": daily_report.get('ai_direction')},
+                "Data Quality": daily_report.get('data_quality'),
+                "Engine Health": daily_report.get('engine_health'),
+                "Reasons": daily_report.get('reasons'),
+                "Analysis": daily_report.get('analysis'),
             })
     else:
         st.warning(
             f"NO VERIFIED DAILY DATA · {display_symbol(symbol)}/D1. "
-            "The daily outlook will appear when the selected pair's D1 feed loads successfully."
+            "The Daily Signal remains unconfirmed until the completed D1 dataset passes quality and engine validation."
         )
 
     st.subheader("2 · Command Center")
@@ -3771,15 +2771,6 @@ def dashboard():
     q3.metric("Data Age", f"{data_quality.get('age_seconds',0):.0f}s")
     q4.metric("Read Only", "YES")
     q5.metric("Execution", "DISABLED")
-    engine_health = a.get("engine_health", {}) or {}
-    eh_status = engine_health.get("status", "UNKNOWN")
-    eh_pct = float(engine_health.get("health_percent", 0.0) or 0.0)
-    if eh_status == "HEALTHY":
-        st.success(f"🟢 ENGINE HEALTH: {engine_health.get('healthy_engines',0)}/{engine_health.get('total_engines',0)} healthy · {eh_pct:.1f}%")
-    elif eh_status == "DEGRADED":
-        st.warning(f"🟠 ENGINE HEALTH DEGRADED: {engine_health.get('healthy_engines',0)}/{engine_health.get('total_engines',0)} healthy · {eh_pct:.1f}%")
-    else:
-        st.error(f"🔴 ENGINE HEALTH FAILED: {engine_health.get('healthy_engines',0)}/{engine_health.get('total_engines',0)} healthy · {eh_pct:.1f}%")
     st.caption(
         f"Pair: {display_symbol(symbol)} · Loaded data pair: {display_symbol(st.session_state.get('data_symbol') or 'NONE')} · "
         f"Timeframe: {timeframe} · Loaded source: {st.session_state.get('data_meta', {}).get('source', 'NONE')} · "
@@ -3787,21 +2778,8 @@ def dashboard():
         f"{validation['rows']:,} candles · Quality: {data_quality['status']} · "
         f"Emergency: {'STOPPED' if st.session_state.emergency else 'NORMAL'}"
     )
-    if str(cfg.data_source).upper() in {"TWELVE DATA", "MT5 REMOTE", "MT5"} and not st.session_state.live_status.get("connected",False):
-        st.warning(f"{cfg.data_source} is selected but no successful live fetch is currently loaded. Signal generation is disabled until the selected pair returns valid candles.")
-
-    # Authoritative market-clock banner. This is independent of candle age.
-    if a.get("session", {}).get("market_open"):
-        st.success(
-            f"🟢 FOREX MARKET OPEN · {a['session']['session']} · "
-            f"UTC {a['session']['utc_timestamp']} · New York {a['session']['new_york_timestamp']}"
-        )
-    else:
-        st.error(
-            f"🔴 FOREX MARKET CLOSED · {a['session']['session']} · "
-            f"UTC {a['session']['utc_timestamp']} · New York {a['session']['new_york_timestamp']} · "
-            "ALL NEW SIGNALS AND PAPER ENTRIES ARE BLOCKED."
-        )
+    if str(cfg.data_source).upper() == "TWELVE DATA" and not st.session_state.live_status.get("connected",False):
+        st.warning("Twelve Data is selected but no successful live fetch is currently loaded. Signal generation is disabled until the selected pair returns valid candles.")
 
     if not df.empty:
         st.info(
@@ -3915,7 +2893,7 @@ def dashboard():
             f"Engine agreement: {a['ensemble'].get('agreement',0):.0f}% · "
             f"AI model confidence: {a['ai'].get('confidence',0):.1f}%"
         )
-        st.json({"AI":a["ai"],"Direct Probability":a.get("direct_probability"),"Advanced Momentum":a["advanced_momentum"],"Volume Flow":a.get("volume_flow"),"Candle Timing":a.get("candle_timing"),"Market Region":a.get("market_region"),"Ensemble":a["ensemble"],"Signal Explanation":a.get("signal_explanation"),"Risk Veto":a.get("risk_veto"),"No Trade":a["no_trade"],"Trade Quality":a["trade_quality"],"Data Quality":a["data_quality"]})
+        st.json({"AI":a["ai"],"Advanced Momentum":a["advanced_momentum"],"Ensemble":a["ensemble"],"No Trade":a["no_trade"],"Trade Quality":a["trade_quality"],"Data Quality":a["data_quality"]})
         st.markdown("### Engine Scoreboard")
         comp = pd.DataFrame(
             {
@@ -4046,7 +3024,6 @@ def dashboard():
                 a["risk"]["approved"] and fx["approved"] and a["ensemble"].get("approved", False)
                 and a["no_trade"]["trade_allowed"] and a["trade_quality"]["decision"] == "TRADE" and timing["fresh"]
                 and not st.session_state.emergency
-                and a["session"].get("market_open", False)
             )
 
             if not a["risk"]["approved"]:
@@ -4098,7 +3075,6 @@ def dashboard():
                 a["risk"]["approved"] and bi["approved"] and a["ensemble"].get("approved", False)
                 and a["no_trade"]["trade_allowed"] and a["trade_quality"]["decision"] == "TRADE" and timing["fresh"]
                 and not st.session_state.emergency
-                and a["session"].get("market_open", False)
             )
 
             if not a["risk"]["approved"]:
@@ -4149,8 +3125,7 @@ def dashboard():
             ("RISK VALID", r["approved"]),
             ("VOLATILITY VALID", a["v"]["regime"] != "EXTREME"),
             ("ECONOMIC EVENT VALID", not a["eco"]["blocked"]),
-            ("FOREX MARKET OPEN", a["se"].get("market_open", False)),
-            ("SESSION VALID", a["se"].get("session_tradeable", False)),
+            ("SESSION VALID", a["se"]["session_tradeable"]),
             ("DATA VALID", validation["data_ok"]),
             ("CORRELATION VALID", a["corr"]["risk"] != "HIGH"),
             ("EMERGENCY STOP OFF", not st.session_state.emergency),
@@ -4282,14 +3257,6 @@ def dashboard():
                 ["Data Integrity", "READY"],
                 ["Live Connection Manager", "READY"],
                 ["Advanced Momentum", "READY"],
-                ["Volume Flow", "READY"],
-                ["Direct Probability", "READY"],
-                ["Candle Timing", "READY"],
-                ["Market Region", "READY"],
-                ["Break-Even", "READY (PAPER)"],
-                ["Analysis Orchestrator", "READY"],
-                ["Signal Explanation", "READY"],
-                ["Risk Veto", "READY"],
                 ["AI Probability", "READY (OPTIONAL ML)"],
                 ["Ensemble Decision", "READY"],
                 ["Confidence / Trade Quality", "READY"],
@@ -4341,437 +3308,181 @@ def dashboard():
     )
 
 
-# -------------------- DATA QUALITY & ENGINE HEALTH VERIFICATION --------------------
-@dataclass
-class EngineHealth:
-    name: str
-    status: str
-    runtime_ms: float
-    output_valid: bool
-    critical: bool
-    error: str = ""
+# -------------------- V13 TWO-LAYER DAILY SIGNAL MODEL --------------------
+# Layer A: stable, validated daily thesis based on completed D1 candles.
+# Layer B: live development of the currently-forming D1 candle.
+# The live layer can confirm/contradict the thesis, but cannot rewrite it
+# during the same UTC day.
 
-class DataQualityEngine:
-    """Independent pre-trade verification of market data quality."""
+DAILY_SIGNAL_STATES = {"BULLISH", "BEARISH", "UNCONFIRMED"}
+LIVE_DAILY_STATES = {"BULLISH", "BEARISH", "NEUTRAL", "UNKNOWN"}
 
-    REQUIRED = ("time", "open", "high", "low", "close")
-
-    def verify(self, df: pd.DataFrame, max_age_seconds: int = 420) -> Dict[str, Any]:
-        checks = {}
-        errors = []
-        if df is None or df.empty:
-            return {"status": "FAILED", "score": 0.0, "checks": {"non_empty": False},
-                    "errors": ["No market data"]}
-
-        checks["non_empty"] = True
-        missing = [c for c in self.REQUIRED if c not in df.columns]
-        checks["required_columns"] = not missing
-        if missing:
-            errors.append("Missing columns: " + ",".join(missing))
-            return {"status": "FAILED", "score": 0.0, "checks": checks, "errors": errors}
-
-        x = df.copy()
-        checks["ohlc_numeric"] = True
-        for c in ("open", "high", "low", "close"):
-            x[c] = pd.to_numeric(x[c], errors="coerce")
-        if x[list(("open","high","low","close"))].isna().any().any():
-            checks["ohlc_numeric"] = False
-            errors.append("Invalid OHLC values")
-
-        checks["positive_prices"] = bool((x[["open","high","low","close"]] > 0).all().all())
-        if not checks["positive_prices"]:
-            errors.append("Non-positive price detected")
-
-        checks["ohlc_structure"] = bool(
-            (x["high"] >= x[["open","close","low"]].max(axis=1)).all()
-            and (x["low"] <= x[["open","close","high"]].min(axis=1)).all()
-        )
-        if not checks["ohlc_structure"]:
-            errors.append("Impossible OHLC structure")
-
-        t = pd.to_datetime(x["time"], utc=True, errors="coerce")
-        checks["timestamps_valid"] = bool(t.notna().all())
-        if not checks["timestamps_valid"]:
-            errors.append("Invalid timestamps")
-        else:
-            checks["chronological"] = bool(t.is_monotonic_increasing)
-            checks["duplicates"] = int(t.duplicated().sum())
-            if not checks["chronological"]:
-                errors.append("Timestamps are not chronological")
-            if checks["duplicates"]:
-                errors.append("Duplicate timestamps detected")
-
-            latest_age = (pd.Timestamp.now(tz="UTC") - t.iloc[-1]).total_seconds()
-            checks["latest_age_seconds"] = float(max(0.0, latest_age))
-            checks["fresh"] = latest_age <= max_age_seconds
-            if not checks["fresh"]:
-                errors.append(f"Stale market data ({latest_age:.0f}s old)")
-
-        checks["finite_values"] = bool(
-            np.isfinite(x[["open","high","low","close"]].to_numpy(dtype=float)).all()
-        )
-        if not checks["finite_values"]:
-            errors.append("Non-finite OHLC values")
-
-        score = 100.0
-        score -= min(40.0, 15.0 * len(errors))
-        score = float(np.clip(score, 0.0, 100.0))
-        status = "HEALTHY" if not errors else ("DEGRADED" if score >= 60 else "FAILED")
-        return {"status": status, "score": score, "checks": checks, "errors": errors}
-
-
-class EngineHealthVerificationLayer:
-    """Runs analysis engines under a common health contract.
-
-    A failed critical engine or failed market-data verification must veto a
-    trade. Advisory failures are exposed as DEGRADED rather than hidden.
-    """
-
-    def __init__(self):
-        self.data_quality = DataQualityEngine()
-        self.history: Dict[str, EngineHealth] = {}
-
-    @staticmethod
-    def _valid_output(value: Any) -> bool:
-        """Validate engine output without treating legitimate optional None fields as failures."""
-        if value is None:
-            return False
-        if isinstance(value, dict):
-            if not value:
-                return False
-            # Optional fields such as BreakEven.trigger are legitimately None
-            # when the engine is not armed. What matters is that the engine
-            # returned a non-empty structured result and did not return NaN.
-            for v in value.values():
-                if isinstance(v, (float, int, np.floating, np.integer)) and not np.isfinite(v):
-                    return False
-            return True
-        if isinstance(value, pd.DataFrame):
-            return not value.empty
-        if isinstance(value, (float, int, np.floating, np.integer)):
-            return bool(np.isfinite(value))
-        return True
-
-    def run_engine(self, name: str, fn, critical: bool = False, *args, **kwargs):
-        import time
-        start = time.perf_counter()
-        try:
-            output = fn(*args, **kwargs)
-            valid = self._valid_output(output)
-            status = "HEALTHY" if valid else "FAILED"
-            err = "" if valid else "Invalid/empty engine output"
-        except Exception as exc:
-            output = None
-            valid = False
-            status = "FAILED"
-            err = f"{type(exc).__name__}: {exc}"
-
-        health = EngineHealth(
-            name=name,
-            status=status,
-            runtime_ms=(time.perf_counter() - start) * 1000.0,
-            output_valid=valid,
-            critical=critical,
-            error=err,
-        )
-        self.history[name] = health
-        return output, health
-
-    def summary(self) -> Dict[str, Any]:
-        items = list(self.history.values())
-        failed_critical = [x.name for x in items if x.critical and x.status == "FAILED"]
-        failed = [x.name for x in items if x.status == "FAILED"]
-        status = "FAILED" if failed_critical else ("DEGRADED" if failed else "HEALTHY")
-        return {
-            "status": status,
-            "total_engines": len(items),
-            "healthy_engines": sum(x.status == "HEALTHY" for x in items),
-            "failed_engines": len(failed),
-            "failed_critical": failed_critical,
-            "failed": failed,
-            "details": {
-                x.name: {
-                    "status": x.status,
-                    "runtime_ms": round(x.runtime_ms, 2),
-                    "output_valid": x.output_valid,
-                    "critical": x.critical,
-                    "error": x.error,
-                } for x in items
-            },
-            "trade_veto": bool(failed_critical),
-        }
-
-    def verify_data(self, df: pd.DataFrame, max_age_seconds: int = 420):
-        return self.data_quality.verify(df, max_age_seconds=max_age_seconds)
-
-    def audit_analysis(self, analysis: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate the exact outputs used by the final V13 decision."""
-        specs = {
-            "TrendEngine": ("trend", True),
-            "MomentumEngine": ("momentum", True),
-            "CurrentVolatility": ("volatility", True),
-            "TechnicalAnalysis": ("technical_analysis", True),
-            "MarketStructure": ("structure", True),
-            "PriceAction": ("price_action", True),
-            "SupportResistance": ("sr", True),
-            "Breakout": ("breakout", True),
-            "FairValueGap": ("fvg", True),
-            "VolumeFlow": ("volume_flow", True),
-            "MarketRegion": ("market_region", True),
-            "CurrencyStrength": ("currency_strength", True),
-            "Correlation": ("correlation", True),
-            "MultiTimeframe": ("mtf", True),
-            "DirectProbability": ("direct_probability", True),
-            "AIMLPrediction": ("ai", True),
-            "AIConfluence": ("ai_confluence", True),
-            "EnsembleDecision": ("ensemble", True),
-            "Confidence": ("ensemble", True),
-            "TradeQuality": ("trade_quality", True),
-            "SignalTiming": ("signal_timing", True),
-            "RiskControl": ("risk", True),
-            "RiskVeto": ("risk_veto", True),
-            "NewsEconomicFilter": ("economic", True),
-            "CandleTiming": ("candle_timing", True),
-            "MomentumDirection": ("advanced_momentum", True),
-            "MarketTracker": ("market_tracker", True),
-            "Regime": ("regime", True),
-            "Liquidity": ("liquidity", True),
-            "COT/Positioning": ("cot", True),
-            "DataIntegrity": ("data_quality", True),
-            "AnalysisAudit": ("analysis_audit", True),
-            "BreakEven": ("break_even", True),
-            "SignalExplanation": ("signal_explanation", True),
-        }
-        details, failed, failed_critical = {}, [], []
-        for name,(key,critical) in specs.items():
-            value=analysis.get(key)
-            valid=self._valid_output(value)
-            if isinstance(value,dict) and not value: valid=False
-            details[name]={"status":"HEALTHY" if valid else "FAILED","output_valid":bool(valid),
-                           "critical":bool(critical),"error":"" if valid else f"Missing/invalid output: {key}"}
-            if not valid:
-                failed.append(name)
-                if critical: failed_critical.append(name)
-        dq=analysis.get("data_quality",{})
-        if not isinstance(dq,dict) or dq.get("status")=="FAILED":
-            if "DataIntegrity" not in failed: failed.append("DataIntegrity")
-            if "DataIntegrity" not in failed_critical: failed_critical.append("DataIntegrity")
-            details["DataIntegrity"].update(status="FAILED",output_valid=False,error="Data quality verification failed")
-        # Cross-engine consistency checks: a directional output is invalid
-        # when the AI conflict layer says the opposite probability is above its
-        # configured veto floor. This prevents contradictory dashboard states.
-        ens = analysis.get("ensemble", {}) or {}
-        ai_conf = analysis.get("ai_confluence", {}) or {}
-        if ens.get("direction") in ("BULLISH", "BEARISH") and ai_conf.get("conflict"):
-            name = "AIConfluenceConsistency"
-            details[name] = {"status":"FAILED","output_valid":False,"critical":True,
-                             "error":"Directional ensemble conflicts with AI probability floor"}
-            failed.append(name); failed_critical.append(name)
-        total=len(specs)
-        healthy=total-len(set(failed))
-        return {
-            "status":"FAILED" if failed_critical else "DEGRADED" if failed else "HEALTHY",
-            "total_engines":total,"healthy_engines":healthy,"failed_engines":len(set(failed)),
-            "health_percent":round(healthy/max(total,1)*100.0,1),
-            "failed":failed,"failed_critical":failed_critical,
-            "trade_veto":bool(failed_critical),"details":details,
-        }
-
-
-health_layer = EngineHealthVerificationLayer()
-
-# -------------------- FVG ENGINE REGISTRY --------------------
-# Exposed as a standalone engine so the orchestrator/dashboard can consume it
-# without replacing or weakening any existing V13 engine.
-fvg_engine = FairValueGapEngine()
-
-def analyze_fair_value_gap(df: pd.DataFrame) -> Dict[str, Any]:
-    """Return the latest active FVG state for the supplied OHLC data."""
-    return fvg_engine.detect(df)
-
-
-
-# -------------------- V13 ENGINE HEALTH REGISTRY --------------------
-# Every analysis engine is registered here. The registry verifies execution
-# and output without replacing the engine's own logic.
-V13_ENGINE_REGISTRY = {
-    "TrendEngine": ("TrendEngine", True),
-    "MomentumEngine": ("MomentumEngine", True),
-    "VolatilityEngine": ("VolatilityEngine", True),
-    "TechnicalAnalysis": ("TechnicalAnalysis", True),
-    "PriceAction": ("PriceAction", True),
-    "MarketStructure": ("MarketStructure", True),
-    "SupportResistance": ("SupportResistance", True),
-    "Breakout": ("Breakout", False),
-    "FairValueGap": ("FairValueGap", False),
-    "VolumeFlow": ("VolumeFlow", False),
-    "MarketRegion": ("MarketRegion", False),
-    "CurrencyStrength": ("CurrencyStrength", False),
-    "Correlation": ("Correlation", False),
-    "MultiTimeframe": ("MultiTimeframe", True),
-    "DirectProbability": ("DirectProbability", True),
-    "AIMLPrediction": ("AIMLPrediction", True),
-    "AIConfluence": ("AIConfluence", True),
-    "EnsembleDecision": ("EnsembleDecision", True),
-    "Confidence": ("Confidence", True),
-    "TradeQuality": ("TradeQuality", True),
-    "SignalTiming": ("SignalTiming", True),
-    "RiskControl": ("RiskControl", True),
-    "RiskVeto": ("RiskVeto", True),
-    "NewsEconomicFilter": ("NewsEconomicFilter", True),
-    "CandleTiming": ("CandleTiming", False),
-    "MomentumDirection": ("MomentumDirection", False),
-    "CurrentVolatility": ("CurrentVolatility", False),
-    "MarketTracker": ("MarketTracker", False),
-}
-
-def _health_call(name: str, fn, df: pd.DataFrame, critical: bool):
-    """Execute one engine through the health layer."""
-    return health_layer.run_engine(name, fn, critical, df)
-
-def run_all_v13_engine_health(df: pd.DataFrame,
-                              engine_functions: Dict[str, Any],
-                              max_age_seconds: int = 420) -> Dict[str, Any]:
-    """
-    Central health gate for V13.
-
-    engine_functions contains the actual callable for each available engine.
-    Missing callables are reported explicitly instead of being counted healthy.
-    """
-    data_quality = health_layer.verify_data(df, max_age_seconds=max_age_seconds)
-    health_layer.history.clear()
-
-    if data_quality["status"] == "FAILED":
-        return {
-            "status": "FAILED",
-            "data_quality": data_quality,
-            "engine_health": health_layer.summary(),
-            "healthy_count": 0,
-            "total_required": len(V13_ENGINE_REGISTRY),
-            "trade_veto": True,
-            "reason": "DATA QUALITY FAILURE",
-        }
-
-    missing = []
-    for engine_name, (_, critical) in V13_ENGINE_REGISTRY.items():
-        fn = engine_functions.get(engine_name)
-        if not callable(fn):
-            missing.append(engine_name)
-            health_layer.history[engine_name] = EngineHealth(
-                name=engine_name,
-                status="FAILED",
-                runtime_ms=0.0,
-                output_valid=False,
-                critical=critical,
-                error="Engine callable not wired into health registry",
-            )
-            continue
-        _health_call(engine_name, fn, df, critical)
-
-    summary = health_layer.summary()
-    healthy = summary["healthy_engines"]
-    total = len(V13_ENGINE_REGISTRY)
-    failed_critical = summary["failed_critical"]
-
-    # A missing/failed critical engine always blocks a trade.
-    trade_veto = bool(
-        data_quality["status"] == "FAILED"
-        or failed_critical
-        or len(missing) > 0 and any(
-            V13_ENGINE_REGISTRY[x][1] for x in missing
-        )
-    )
-
-    if trade_veto:
-        overall = "FAILED"
-    elif summary["failed"]:
-        overall = "DEGRADED"
+def _v13_utc_day_key(ts=None):
+    t = pd.Timestamp(ts if ts is not None else datetime.now(timezone.utc))
+    if t.tzinfo is None:
+        t = t.tz_localize("UTC")
     else:
-        overall = "HEALTHY"
+        t = t.tz_convert("UTC")
+    return t.date().isoformat()
 
-    return {
-        "status": overall,
-        "data_quality": data_quality,
-        "engine_health": summary,
-        "healthy_count": healthy,
-        "total_required": total,
-        "failed_count": total - healthy,
-        "missing_engines": missing,
-        "health_percent": round((healthy / total) * 100.0, 2) if total else 0.0,
-        "trade_veto": trade_veto,
-    }
+def _v13_completed_daily_frame(df):
+    """Return completed D1 candles only; never use the forming D1 candle."""
+    x = MarketDataEngine.normalize(df)
+    if x.empty:
+        return x
+    x = x.sort_index()
+    if x.index.tz is None:
+        x.index = x.index.tz_localize("UTC")
+    else:
+        x.index = x.index.tz_convert("UTC")
 
+    x = x[x.index.dayofweek < 5].copy()
+    if x.empty:
+        return x
 
-def build_v13_engine_functions(context: Dict[str, Any]) -> Dict[str, Any]:
+    now = pd.Timestamp(datetime.now(timezone.utc))
+    # Current UTC day is not yet a completed daily candle.
+    if x.index[-1].date() >= now.date():
+        x = x.iloc[:-1].copy()
+    return x
+
+def _v13_forming_daily_frame(df):
+    """Return the live D1 dataset separately from the completed D1 dataset."""
+    x = MarketDataEngine.normalize(df)
+    if x.empty:
+        return x
+    x = x.sort_index()
+    if x.index.tz is None:
+        x.index = x.index.tz_localize("UTC")
+    else:
+        x.index = x.index.tz_convert("UTC")
+    return x[x.index.dayofweek < 5].copy()
+
+def _v13_direction_from_score(score):
+    if score > 0.10:
+        return "BULLISH"
+    if score < -0.10:
+        return "BEARISH"
+    return "UNCONFIRMED"
+
+def build_v13_daily_signal_layers(df_d1, analysis_result=None):
     """
-    Adapter registry.
+    Produce two independent D1 outputs:
+      - validated Daily Signal from completed candles
+      - live development from the forming candle
 
-    The existing V13 engine implementations remain authoritative. The
-    orchestrator supplies callables here; the health layer only verifies that
-    they execute and return valid output.
+    The second layer is informational/confirmatory and never overwrites the
+    first layer during the same UTC day.
     """
-    return {
-        # These adapters use existing engine classes/functions when present.
-        # Unavailable optional engines remain explicitly FAILED rather than
-        # being falsely reported as healthy.
-        "TrendEngine": context.get("trend_fn"),
-        "MomentumEngine": context.get("momentum_fn"),
-        "VolatilityEngine": context.get("volatility_fn"),
-        "TechnicalAnalysis": context.get("technical_fn"),
-        "PriceAction": context.get("price_action_fn"),
-        "MarketStructure": context.get("structure_fn"),
-        "SupportResistance": context.get("support_resistance_fn"),
-        "Breakout": context.get("breakout_fn"),
-        "FairValueGap": context.get("fvg_fn"),
-        "VolumeFlow": context.get("volume_flow_fn"),
-        "MarketRegion": context.get("market_region_fn"),
-        "CurrencyStrength": context.get("currency_strength_fn"),
-        "Correlation": context.get("correlation_fn"),
-        "MultiTimeframe": context.get("mtf_fn"),
-        "DirectProbability": context.get("probability_fn"),
-        "AIMLPrediction": context.get("ml_fn"),
-        "AIConfluence": context.get("ai_confluence_fn"),
-        "EnsembleDecision": context.get("ensemble_fn"),
-        "Confidence": context.get("confidence_fn"),
-        "TradeQuality": context.get("trade_quality_fn"),
-        "SignalTiming": context.get("signal_timing_fn"),
-        "RiskControl": context.get("risk_control_fn"),
-        "RiskVeto": context.get("risk_veto_fn"),
-        "NewsEconomicFilter": context.get("news_fn"),
-        "CandleTiming": context.get("candle_timing_fn"),
-        "MomentumDirection": context.get("momentum_direction_fn"),
-        "CurrentVolatility": context.get("current_volatility_fn"),
-        "MarketTracker": context.get("market_tracker_fn"),
-    }
+    completed = _v13_completed_daily_frame(df_d1)
+    forming = _v13_forming_daily_frame(df_d1)
+    ar = analysis_result or {}
 
+    if completed.empty:
+        return {
+            "daily_signal": "UNCONFIRMED",
+            "daily_signal_status": "DATA_INVALID",
+            "daily_signal_locked": False,
+            "daily_signal_day": _v13_utc_day_key(),
+            "completed_d1_candle": None,
+            "live_daily_state": "UNKNOWN",
+            "live_daily_alignment": "UNKNOWN",
+            "live_daily_warning": "Insufficient completed D1 data.",
+        }
 
-def verify_v13_health(df: pd.DataFrame, context: Optional[Dict[str, Any]] = None,
-                      max_age_seconds: int = 420) -> Dict[str, Any]:
-    """Single entry point for the dashboard/decision pipeline."""
-    context = context or {}
-    functions = build_v13_engine_functions(context)
-    return run_all_v13_engine_health(
-        df, functions, max_age_seconds=max_age_seconds
+    # Normalize directional evidence from the existing V13 engines.
+    directional = []
+    keys = (
+        "trend", "momentum", "structure", "price_action",
+        "support_resistance", "breakout", "fvg", "volume_flow",
+        "currency_strength", "correlation", "ai", "probability",
+        "ml", "mtf", "confluence"
     )
+    for key in keys:
+        v = ar.get(key)
+        blob = str(v).upper()
+        if "BULL" in blob or "UP" in blob or "BUY" in blob:
+            directional.append(1.0)
+        elif "BEAR" in blob or "DOWN" in blob or "SELL" in blob:
+            directional.append(-1.0)
 
+    score = float(np.mean(directional)) if directional else 0.0
+    daily_signal = _v13_direction_from_score(score)
 
-# -------------------- HEALTH DISPLAY HELPERS --------------------
-def v13_health_label(report: Dict[str, Any]) -> str:
-    status = report.get("status", "FAILED")
-    pct = report.get("health_percent", 0.0)
-    return f"{status} — {pct:.1f}% engines healthy"
+    # AI is a validation layer: material opposition prevents a false daily
+    # lock instead of allowing one engine to silently override all others.
+    ai_up = ar.get("ai_up_probability", ar.get("up_probability"))
+    ai_down = ar.get("ai_down_probability", ar.get("down_probability"))
+    try:
+        ai_up = float(ai_up) if ai_up is not None else None
+        ai_down = float(ai_down) if ai_down is not None else None
+    except (TypeError, ValueError):
+        ai_up, ai_down = None, None
 
+    if daily_signal == "BULLISH" and ai_down is not None and ai_down >= 0.55:
+        daily_signal = "UNCONFIRMED"
+    elif daily_signal == "BEARISH" and ai_up is not None and ai_up >= 0.55:
+        daily_signal = "UNCONFIRMED"
 
-def v13_trade_gate(report: Dict[str, Any]) -> Tuple[bool, str]:
-    """Return (allowed, reason). This is fail-closed."""
-    if report.get("trade_veto"):
-        if report.get("data_quality", {}).get("status") == "FAILED":
-            return False, "NO TRADE: DATA QUALITY FAILURE"
-        failed = report.get("engine_health", {}).get("failed_critical", [])
-        if failed:
-            return False, "NO TRADE: CRITICAL ENGINE FAILURE — " + ", ".join(failed)
-        return False, "NO TRADE: ENGINE HEALTH DEGRADED"
-    return True, "ENGINE HEALTH PASS"
+    health = str(ar.get("health_status", "HEALTHY")).upper()
+    data = str(ar.get("data_quality_status", "PASS")).upper()
+    if health in {"FAILED", "CRITICAL"} or data in {"FAILED", "INVALID", "STALE"}:
+        daily_signal = "UNCONFIRMED"
+
+    live_state = "UNKNOWN"
+    live_alignment = "UNKNOWN"
+    warning = ""
+
+    if not forming.empty:
+        last = forming.iloc[-1]
+        try:
+            body = float(last["close"]) - float(last["open"])
+            live_state = "BULLISH" if body > 0 else "BEARISH" if body < 0 else "NEUTRAL"
+        except Exception:
+            live_state = "UNKNOWN"
+
+        if daily_signal in {"BULLISH", "BEARISH"} and live_state in {"BULLISH", "BEARISH"}:
+            live_alignment = "CONFIRMING" if live_state == daily_signal else "CONTRADICTING"
+            if live_alignment == "CONTRADICTING":
+                warning = (
+                    "The forming D1 candle contradicts the locked Daily Signal. "
+                    "Do not rewrite the Daily Signal; require stronger intraday confirmation."
+                )
+        elif daily_signal == "UNCONFIRMED":
+            live_alignment = "NO_CONFIRMED_THESIS"
+
+    return {
+        "daily_signal": daily_signal,
+        "daily_signal_status": "VALIDATED" if daily_signal != "UNCONFIRMED" else "UNCONFIRMED",
+        "daily_signal_locked": daily_signal != "UNCONFIRMED",
+        "daily_signal_day": _v13_utc_day_key(),
+        "completed_d1_candle": str(completed.index[-1]),
+        "live_daily_state": live_state,
+        "live_daily_alignment": live_alignment,
+        "live_daily_warning": warning,
+        "engine_directional_score": round(score, 4),
+        "ai_up_probability": ai_up,
+        "ai_down_probability": ai_down,
+    }
+
+def render_v13_daily_signal_layers(report):
+    """Optional dashboard panel for the stable Daily Signal/live D1 split."""
+    if not isinstance(report, dict):
+        return
+    st.subheader("Daily Signal")
+    st.metric("Validated Daily Signal", report.get("daily_signal", "UNCONFIRMED"))
+    st.caption(
+        f"Status: {report.get('daily_signal_status', 'UNKNOWN')} · "
+        f"UTC day: {report.get('daily_signal_day', '—')}"
+    )
+    st.metric("Developing D1 Candle", report.get("live_daily_state", "UNKNOWN"))
+    st.caption(
+        "Relationship to Daily Signal: "
+        f"{report.get('live_daily_alignment', 'UNKNOWN')}"
+    )
+    if report.get("live_daily_warning"):
+        st.warning(report["live_daily_warning"])
+
 
 if __name__ == "__main__":
     dashboard()
