@@ -3405,19 +3405,27 @@ def fmt(v, n=2):
 # V13 ADDITION: DERIV REAL-FOREX LIVE STREAM (READ-ONLY)
 # ============================================================
 class DerivRealForexStream:
-    """Additive read-only Deriv real-Forex tick stream.
+    """Additive, read-only Deriv REAL-FOREX market-data stream.
 
-    This adapter accepts only instruments whose active_symbols metadata identifies
-    both market=forex and underlying_symbol_type=forex. Synthetic/derived symbols
-    are rejected before they can enter the V13 market-data layer.
+    This layer deliberately does not touch the V13 decision engines. It only
+    supplies validated current Forex prices/candles to the existing data layer.
 
-    It bootstraps OHLC candles with ticks_history, then keeps the currently-forming
-    candle updated from the live tick subscription. No account authentication and
-    no order/trading endpoint is used.
+    V4 fixes:
+      * Uses current public endpoint first, with a legacy public endpoint fallback.
+      * Validates EUR/USD using current and legacy active-symbol field names.
+      * Starts with ONE timeframe (the requested timeframe) instead of issuing
+        seven simultaneous history requests.
+      * If candle-history validation fails, falls back to tick history and builds
+        the requested OHLC candles locally.
+      * Uses req_id/passthrough correlation and does not depend on echo_req.
     """
     TF_SECONDS = {"M1":60, "M5":300, "M15":900, "M30":1800, "H1":3600, "H4":14400, "D1":86400}
     _registry = {}
     _registry_lock = threading.RLock()
+    PUBLIC_ENDPOINTS = (
+        "wss://api.derivws.com/trading/v1/options/ws/public",
+        "wss://ws.binaryws.com/websockets/v3",
+    )
 
     @classmethod
     def symbol_map(cls):
@@ -3435,20 +3443,26 @@ class DerivRealForexStream:
         self.deriv_symbol = self.symbol_map().get(self.symbol)
         if not self.deriv_symbol:
             raise RuntimeError(f"Deriv real-Forex mapping is unavailable for {self.symbol}.")
-        self.endpoint = endpoint
-        self.outputsize = int(outputsize)
-        self.reconnect_seconds = int(reconnect_seconds)
+        self.endpoint = endpoint or self.PUBLIC_ENDPOINTS[0]
+        self.outputsize = max(100, int(outputsize))
+        self.reconnect_seconds = max(2, int(reconnect_seconds))
         self.ws = None
         self.thread = None
         self.stop_event = threading.Event()
-        self.ready_event = threading.Event()
-        self.history_events = {}
         self.lock = threading.RLock()
         self.frames = {}
-        self.status = {"connected":False,"validated":False,"source":"DERIV REAL FOREX","symbol":self.symbol,
-                       "deriv_symbol":self.deriv_symbol,"last_tick":None,"last_quote":None,
-                       "error":None,"streaming":False,"synthetic":False,"read_only":True,
-                       "execution_enabled":False}
+        self.request_context = {}
+        self.history_received = set()
+        self.tick_subscribed = False
+        self._endpoint_index = 0
+        self.status = {
+            "connected":False, "validated":False, "source":"DERIV REAL FOREX",
+            "symbol":self.symbol, "deriv_symbol":self.deriv_symbol,
+            "last_tick":None, "last_quote":None, "error":None,
+            "streaming":False, "synthetic":False, "read_only":True,
+            "execution_enabled":False, "endpoint":self.endpoint,
+            "stage":"IDLE"
+        }
 
     @classmethod
     def get(cls, symbol, endpoint, outputsize=500, reconnect_seconds=5):
@@ -3461,170 +3475,307 @@ class DerivRealForexStream:
             return obj
 
     def _send(self, payload):
-        if self.ws is not None:
-            self.ws.send(json.dumps(payload))
+        if self.ws is None:
+            raise RuntimeError("Deriv WebSocket is not connected.")
+        self.ws.send(json.dumps(payload))
 
     def _validate_active_symbols(self, rows):
         for item in rows or []:
             sym = item.get("underlying_symbol", item.get("symbol"))
-            market = str(item.get("market", "")).lower()
-            typ = str(item.get("underlying_symbol_type", item.get("symbol_type", ""))).lower()
+            market = str(item.get("market", "")).strip().lower()
+            typ = str(item.get("underlying_symbol_type", item.get("symbol_type", ""))).strip().lower()
             if sym == self.deriv_symbol and market == "forex" and typ == "forex":
                 with self.lock:
-                    self.status["validated"] = True
+                    self.status.update({"validated":True, "stage":"FOREX_VALIDATED", "error":None})
                 return True
-        raise RuntimeError(f"{self.deriv_symbol} was not validated as a real Forex instrument by Deriv active_symbols.")
+        raise RuntimeError(
+            f"Deriv did not classify {self.deriv_symbol} as Forex. "
+            "Synthetic/derived instruments are rejected."
+        )
 
     def _on_open(self, ws):
         with self.lock:
-            self.status.update({"connected":True,"streaming":False,"error":None,"endpoint":self.endpoint})
+            self.status.update({"connected":True,"streaming":False,"error":None,"stage":"REQUESTING_SYMBOLS","endpoint":self.endpoint})
+        # Current Deriv API supports active_symbols=brief and the legacy public
+        # endpoint also accepts it. No account/authentication is used.
         self._send({"active_symbols":"brief","req_id":1001})
+
+    def _history_request(self, timeframe):
+        sec = self.TF_SECONDS[timeframe]
+        req_id = 2000
+        self.request_context[req_id] = {"kind":"candles", "timeframe":timeframe}
+        self.status["stage"] = f"REQUESTING_{timeframe}_HISTORY"
+        self._send({
+            "ticks_history": self.deriv_symbol,
+            "count": self.outputsize,
+            "end": "latest",
+            "style": "candles",
+            "granularity": sec,
+            "subscribe": 0,
+            "req_id": req_id,
+            "passthrough": {"v13_kind":"candles", "v13_tf":timeframe, "v13_req_id":req_id},
+        })
+
+    def _tick_history_fallback(self, timeframe):
+        # One-time tick-history request. The resulting ticks are locally
+        # aggregated into OHLC because some public API variants may reject
+        # candle-style history requests.
+        req_id = 2100
+        self.request_context[req_id] = {"kind":"ticks_history", "timeframe":timeframe}
+        self.status["stage"] = f"FALLBACK_TICK_HISTORY_{timeframe}"
+        # Request enough ticks to construct a useful initial set of candles.
+        count = min(5000, max(1000, self.outputsize * 8))
+        self._send({
+            "ticks_history": self.deriv_symbol,
+            "count": count,
+            "end": "latest",
+            "style": "ticks",
+            "subscribe": 0,
+            "req_id": req_id,
+            "passthrough": {"v13_kind":"ticks_history", "v13_tf":timeframe, "v13_req_id":req_id},
+        })
+
+    def _ticks_to_candles(self, prices, times, timeframe):
+        if not prices or not times or timeframe not in self.TF_SECONDS:
+            return pd.DataFrame()
+        sec = self.TF_SECONDS[timeframe]
+        rows=[]
+        for ts, price in zip(times, prices):
+            try:
+                epoch=int(ts); q=float(price)
+                if not math.isfinite(q):
+                    continue
+                bucket=(epoch//sec)*sec
+                rows.append((bucket,q))
+            except Exception:
+                continue
+        if not rows:
+            return pd.DataFrame()
+        d=pd.DataFrame(rows, columns=["bucket","price"])
+        g=d.groupby("bucket", sort=True)
+        out=g["price"].agg(open="first", high="max", low="min", close="last").reset_index()
+        out["time"]=pd.to_datetime(out["bucket"], unit="s", utc=True)
+        out["volume"]=0.0
+        out=out[["time","open","high","low","close","volume"]]
+        return MarketDataEngine.normalize(out).tail(self.outputsize).reset_index(drop=True)
+
+    def _subscribe_ticks(self):
+        self.status["stage"] = "SUBSCRIBING_LIVE_TICKS"
+        self._send({
+            "ticks": self.deriv_symbol,
+            "subscribe": 1,
+            "req_id": 3001,
+            "passthrough": {"v13_stream":"forex_ticks", "symbol":self.deriv_symbol},
+        })
 
     def _on_message(self, ws, raw):
         try:
             data = json.loads(raw)
         except Exception:
             return
-        if data.get("error"):
-            err = data.get("error") or {}
-            with self.lock:
-                self.status["error"] = err.get("message") or err.get("code") or "Deriv WebSocket error"
-            return
+
+        # Current API can return an errors array, while older responses use error.
         if data.get("errors"):
-            errors = data.get("errors") or []
-            msg = "; ".join(str(e.get("message") or e.get("code") or e) for e in errors)
+            errors=data.get("errors") or []
+            msg="; ".join(str(e.get("message") or e.get("code") or e) for e in errors)
             with self.lock:
-                self.status["error"] = msg or "Deriv WebSocket returned validation errors"
+                self.status["error"] = msg or "Deriv returned validation errors"
+                self.status["stage"] = "ERROR"
             return
-        typ = data.get("msg_type")
+        if data.get("error"):
+            err=data.get("error") or {}
+            with self.lock:
+                self.status["error"] = str(err.get("message") or err.get("code") or err)
+                self.status["stage"] = "ERROR"
+            return
+
+        typ=data.get("msg_type")
         if typ == "active_symbols":
             try:
                 self._validate_active_symbols(data.get("active_symbols", []))
-                for tf in self.TF_SECONDS:
-                    req_id = 2000 + list(self.TF_SECONDS).index(tf)
-                    self._send({"ticks_history": self.deriv_symbol, "count": self.outputsize, "end": "latest",
-                                "style": "candles", "granularity": self.TF_SECONDS[tf],
-                                "subscribe": 0, "req_id": req_id,
-                                "passthrough": {"v13_tf": tf, "v13_req_id": req_id}})
-                self._send({"ticks": self.deriv_symbol, "subscribe": 1, "req_id": 3001,
-                            "passthrough": {"v13_stream": "forex_ticks", "symbol": self.deriv_symbol}})
+                # Only request the timeframe that V13 actually asked for.
+                tf=getattr(self, "requested_timeframe", "M15")
+                if tf not in self.TF_SECONDS:
+                    tf="M15"
+                self._history_request(tf)
             except Exception as ex:
-                with self.lock: self.status["error"] = str(ex)
+                with self.lock:
+                    self.status["error"]=str(ex); self.status["stage"]="FOREX_VALIDATION_ERROR"
             return
+
         if typ == "candles":
-            echo_req = data.get("echo_req") or {}
-            passthrough = data.get("passthrough") or echo_req.get("passthrough") or {}
-            req_id = passthrough.get("v13_req_id", echo_req.get("req_id", 0))
-            try:
-                req_id = int(req_id or 0)
-            except Exception:
-                req_id = 0
-            idx = req_id - 2000
-            tfs = list(self.TF_SECONDS)
-            tf = passthrough.get("v13_tf")
-            if not tf and 0 <= idx < len(tfs):
-                tf = tfs[idx]
-            if tf in self.TF_SECONDS:
-                rows = data.get("candles", [])
-                frame = pd.DataFrame(rows)
-                if not frame.empty:
-                    frame = frame.rename(columns={"epoch":"time"})
-                    frame["time"] = pd.to_datetime(pd.to_numeric(frame["time"], errors="coerce"), unit="s", utc=True)
+            ctx={}
+            echo=data.get("echo_req") or {}
+            passthrough=data.get("passthrough") or echo.get("passthrough") or {}
+            req_id=passthrough.get("v13_req_id", echo.get("req_id"))
+            try: req_id=int(req_id)
+            except Exception: req_id=0
+            ctx=self.request_context.get(req_id, {})
+            tf=passthrough.get("v13_tf") or ctx.get("timeframe") or getattr(self,"requested_timeframe","M15")
+            rows=data.get("candles") or []
+            if rows:
+                frame=pd.DataFrame(rows).rename(columns={"epoch":"time"})
+                if not frame.empty and "time" in frame.columns:
+                    frame["time"]=pd.to_datetime(pd.to_numeric(frame["time"],errors="coerce"),unit="s",utc=True)
                     for c in ["open","high","low","close"]:
-                        frame[c] = pd.to_numeric(frame[c], errors="coerce")
-                    frame["volume"] = 0.0
-                    frame = frame[["time","open","high","low","close","volume"]].dropna()
-                    with self.lock:
-                        self.frames[tf] = MarketDataEngine.normalize(frame)
-                        self.history_events[tf] = True
+                        if c in frame.columns: frame[c]=pd.to_numeric(frame[c],errors="coerce")
+                    frame["volume"]=0.0
+                    needed=["time","open","high","low","close","volume"]
+                    if all(c in frame.columns for c in needed):
+                        frame=MarketDataEngine.normalize(frame[needed]).tail(self.outputsize).reset_index(drop=True)
+                        if not frame.empty:
+                            with self.lock:
+                                self.frames[tf]=frame
+                                self.history_received.add(tf)
+                                self.status["stage"]=f"{tf}_HISTORY_READY"
+                            self._subscribe_ticks()
+                            return
+            # Candle response was empty/invalid: use tick-history fallback.
+            self._tick_history_fallback(tf)
             return
+
+        if typ == "history":
+            echo=data.get("echo_req") or {}
+            passthrough=data.get("passthrough") or echo.get("passthrough") or {}
+            req_id=passthrough.get("v13_req_id", echo.get("req_id"))
+            try: req_id=int(req_id)
+            except Exception: req_id=0
+            ctx=self.request_context.get(req_id,{})
+            tf=passthrough.get("v13_tf") or ctx.get("timeframe") or getattr(self,"requested_timeframe","M15")
+            hist=data.get("history") or {}
+            frame=self._ticks_to_candles(hist.get("prices") or [], hist.get("times") or [], tf)
+            if frame.empty:
+                with self.lock:
+                    self.status["error"]=f"No usable {tf} historical ticks returned for {self.deriv_symbol}."
+                    self.status["stage"]="HISTORY_EMPTY"
+                return
+            with self.lock:
+                self.frames[tf]=frame
+                self.history_received.add(tf)
+                self.status["stage"]=f"{tf}_HISTORY_READY"
+            self._subscribe_ticks()
+            return
+
         if typ == "tick" and data.get("tick"):
-            tick = data["tick"]
+            tick=data["tick"]
             try:
-                quote = float(tick["quote"]); epoch = int(tick["epoch"])
-                if tick.get("symbol") != self.deriv_symbol or not math.isfinite(quote):
-                    return
-                ts = pd.Timestamp(epoch, unit="s", tz="UTC")
+                quote=float(tick["quote"]); epoch=int(tick["epoch"])
+                tsymbol=tick.get("symbol") or tick.get("underlying_symbol")
+                if tsymbol and tsymbol != self.deriv_symbol: return
+                if not math.isfinite(quote): return
+                ts=pd.Timestamp(epoch,unit="s",tz="UTC")
             except Exception:
                 return
             with self.lock:
-                sub = data.get("subscription") or {}
-                self.status.update({"last_tick":ts.isoformat(),"last_quote":quote,"streaming":True,
-                                    "subscription_id": sub.get("id", self.status.get("subscription_id"))})
+                sub=data.get("subscription") or {}
+                self.tick_subscribed=True
+                self.status.update({
+                    "last_tick":ts.isoformat(), "last_quote":quote,
+                    "streaming":True, "stage":"LIVE_TICK_RECEIVING",
+                    "subscription_id":sub.get("id",self.status.get("subscription_id")),
+                })
                 for tf, seconds in self.TF_SECONDS.items():
-                    start = pd.Timestamp((epoch // seconds) * seconds, unit="s", tz="UTC")
-                    frame = self.frames.get(tf)
-                    if frame is None or frame.empty:
+                    # Only maintain the timeframe requested by the current V13
+                    # data source. This avoids unnecessary memory/work.
+                    if tf != getattr(self,"requested_timeframe",tf):
                         continue
-                    if frame.iloc[-1]["time"] < start:
-                        new = pd.DataFrame([{"time":start,"open":quote,"high":quote,"low":quote,"close":quote,"volume":0.0}])
-                        frame = pd.concat([frame,new], ignore_index=True)
-                    elif frame.iloc[-1]["time"] == start:
-                        i = frame.index[-1]
-                        frame.at[i,"high"] = max(float(frame.at[i,"high"]), quote)
-                        frame.at[i,"low"] = min(float(frame.at[i,"low"]), quote)
-                        frame.at[i,"close"] = quote
-                    self.frames[tf] = frame.tail(self.outputsize).reset_index(drop=True)
+                    start=pd.Timestamp((epoch//seconds)*seconds,unit="s",tz="UTC")
+                    frame=self.frames.get(tf)
+                    if frame is None or frame.empty: continue
+                    last_time=frame.iloc[-1]["time"]
+                    if last_time < start:
+                        new=pd.DataFrame([{"time":start,"open":quote,"high":quote,"low":quote,"close":quote,"volume":0.0}])
+                        frame=pd.concat([frame,new],ignore_index=True)
+                    elif last_time == start:
+                        i=frame.index[-1]
+                        frame.at[i,"high"]=max(float(frame.at[i,"high"]),quote)
+                        frame.at[i,"low"]=min(float(frame.at[i,"low"]),quote)
+                        frame.at[i,"close"]=quote
+                    self.frames[tf]=frame.tail(self.outputsize).reset_index(drop=True)
+            return
 
     def _on_error(self, ws, error):
         with self.lock:
-            self.status["error"] = str(error)
-            self.status["connected"] = False
+            self.status["error"]=str(error)
+            self.status["connected"]=False
+            self.status["streaming"]=False
+            self.status["stage"]="WEBSOCKET_ERROR"
 
     def _on_close(self, ws, code, msg):
         with self.lock:
-            self.status["connected"] = False
-            self.status["streaming"] = False
+            self.status["connected"]=False
+            self.status["streaming"]=False
+            self.status["stage"]=f"CLOSED:{code}"
 
     def _run(self):
+        endpoints=[self.endpoint] + [e for e in self.PUBLIC_ENDPOINTS if e != self.endpoint]
         while not self.stop_event.is_set():
             try:
-                self.ready_event.clear()
-                self.ws = websocket.WebSocketApp(self.endpoint, on_open=self._on_open,
-                    on_message=self._on_message, on_error=self._on_error, on_close=self._on_close)
-                self.ws.run_forever(ping_interval=20, ping_timeout=10)
+                self.endpoint=endpoints[self._endpoint_index % len(endpoints)]
+                self.ws=websocket.WebSocketApp(
+                    self.endpoint,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+                self.ws.run_forever(ping_interval=20,ping_timeout=10)
             except Exception as ex:
-                with self.lock: self.status["error"] = str(ex)
+                with self.lock:
+                    self.status["error"]=str(ex); self.status["stage"]="CONNECT_EXCEPTION"
             if not self.stop_event.is_set():
+                # If the endpoint itself is rejecting the request, alternate
+                # once before the normal reconnect delay.
+                with self.lock:
+                    err=str(self.status.get("error") or "").lower()
+                if "validation" in err or "400" in err or "invalid request" in err:
+                    self._endpoint_index=(self._endpoint_index+1)%len(endpoints)
                 _time.sleep(self.reconnect_seconds)
 
-    def start(self, wait_seconds=15):
+    def start(self, timeframe="M15", wait_seconds=20):
+        self.requested_timeframe=str(timeframe).upper()
+        if self.requested_timeframe not in self.TF_SECONDS:
+            raise RuntimeError(f"Unsupported Deriv timeframe: {timeframe}")
         if self.thread and self.thread.is_alive():
+            # Existing connection may already be healthy; otherwise it will
+            # reconnect using the existing requested timeframe.
             return self.snapshot()
         self.stop_event.clear()
-        self.thread = threading.Thread(target=self._run, name=f"deriv-forex-{self.symbol}", daemon=True)
+        self.thread=threading.Thread(target=self._run,name=f"deriv-forex-{self.symbol}",daemon=True)
         self.thread.start()
-        deadline = _time.time() + wait_seconds
-        while _time.time() < deadline:
+        deadline=_time.time()+wait_seconds
+        while _time.time()<deadline:
             with self.lock:
-                if self.status.get("validated") and self.frames:
-                    return self.snapshot()
-                err = self.status.get("error")
-            if err:
-                raise RuntimeError(err)
+                ready=bool(self.status.get("validated") and self.frames.get(self.requested_timeframe) is not None)
+                live=bool(self.status.get("streaming"))
+                err=self.status.get("error")
+            if ready:
+                # Historical bootstrap is enough to return data; live status is
+                # displayed separately so a brief tick delay isn't misreported
+                # as an input-validation failure.
+                return self.snapshot()
+            if err and ("validation" in str(err).lower() or "invalid request" in str(err).lower()):
+                # Allow endpoint fallback before surfacing the error.
+                pass
             _time.sleep(0.1)
-        status = self.snapshot()
-        detail = status.get("error") or "No validation/bootstrap response received before timeout."
-        raise RuntimeError(f"Deriv real-Forex stream startup failed: {detail} | status={status}")
+        return self.snapshot()
 
-    def frame(self, timeframe):
+    def frame(self,timeframe):
         with self.lock:
-            df = self.frames.get(str(timeframe).upper())
-            return None if df is None else df.copy()
+            frame=self.frames.get(str(timeframe).upper())
+            return None if frame is None else frame.copy()
 
     def snapshot(self):
         with self.lock:
-            s = dict(self.status)
-        last = s.get("last_tick")
-        if last:
-            try:
-                age = max(0.0, (pd.Timestamp.now(tz="UTC") - pd.Timestamp(last)).total_seconds())
-            except Exception:
-                age = float("inf")
-        else:
-            age = float("inf")
-        s["tick_age_seconds"] = round(age, 2) if math.isfinite(age) else None
-        s["healthy"] = bool(s.get("connected") and s.get("validated") and s.get("streaming"))
+            s=dict(self.status)
+            s["history_ready"]={k:(v is not None and not v.empty) for k,v in self.frames.items()}
+        last=s.get("last_tick")
+        try:
+            age=(pd.Timestamp.now(tz="UTC")-pd.Timestamp(last)).total_seconds() if last else float("inf")
+        except Exception:
+            age=float("inf")
+        s["tick_age_seconds"]=round(age,2) if math.isfinite(age) else None
+        s["healthy"]=bool(s.get("connected") and s.get("validated") and s.get("streaming"))
         return s
 
     def stop(self):
@@ -3633,30 +3784,37 @@ class DerivRealForexStream:
             if self.ws: self.ws.close()
         except Exception: pass
         with self.lock:
-            self.status["connected"] = False
-            self.status["streaming"] = False
+            self.status["connected"]=False
+            self.status["streaming"]=False
+            self.status["stage"]="STOPPED"
 
 
 def get_deriv_real_forex_data(symbol: str, timeframe: str, cfg: Config, force=False):
     """Return validated live Deriv real-Forex candles for the existing V13 data layer."""
     if websocket is None:
         raise RuntimeError("Deriv streaming requires websocket-client. Add websocket-client to requirements.txt.")
-    symbol = canonical_symbol(symbol); timeframe = str(timeframe).upper()
+    symbol=canonical_symbol(symbol); timeframe=str(timeframe).upper()
     if symbol not in DerivRealForexStream.symbol_map():
         raise RuntimeError(f"No verified Deriv real-Forex mapping configured for {symbol}.")
-    stream = DerivRealForexStream.get(symbol, cfg.deriv_stream_endpoint, cfg.deriv_stream_outputsize, cfg.deriv_stream_reconnect_seconds)
-    stream.start()
-    df = stream.frame(timeframe)
+    stream=DerivRealForexStream.get(symbol,cfg.deriv_stream_endpoint,cfg.deriv_stream_outputsize,cfg.deriv_stream_reconnect_seconds)
+    status=stream.start(timeframe=timeframe)
+    df=stream.frame(timeframe)
     if df is None or df.empty:
-        raise RuntimeError(f"Deriv real-Forex stream has not produced {symbol}/{timeframe} candles yet.")
-    status = stream.snapshot()
-    if not status.get("healthy") or (status.get("tick_age_seconds") is not None and status["tick_age_seconds"] > cfg.deriv_stream_stale_seconds):
-        raise RuntimeError(f"Deriv real-Forex stream is stale/unhealthy for {symbol}: {status}")
-    meta = {"symbol":symbol,"timeframe":timeframe,"source":"DERIV REAL FOREX",
-            "provider_symbol":stream.deriv_symbol,"synthetic":False,"market":"FOREX",
-            "underlying_symbol_type":"forex","read_only":True,"execution_enabled":False,
-            "streaming":True,"stream_health":status,"fetched_at":datetime.now(timezone.utc).isoformat()}
-    return MarketDataEngine.normalize(df), meta
+        raise RuntimeError(f"Deriv real-Forex stream did not produce {symbol}/{timeframe} candles. Diagnostic: {status}")
+    # For initial bootstrap, require validated Forex history. The existing V13
+    # health layer remains responsible for deciding whether a stale stream may
+    # be used for trading.
+    validation=MarketDataEngine.validate(df)
+    if not validation.get("data_ok"):
+        raise RuntimeError(f"Deriv {symbol}/{timeframe} input validation failed: {validation}")
+    meta={
+        "symbol":symbol,"timeframe":timeframe,"source":"DERIV REAL FOREX",
+        "provider_symbol":stream.deriv_symbol,"synthetic":False,"market":"FOREX",
+        "underlying_symbol_type":"forex","read_only":True,"execution_enabled":False,
+        "streaming":bool(status.get("streaming")),"stream_health":status,
+        "fetched_at":datetime.now(timezone.utc).isoformat(),
+    }
+    return MarketDataEngine.normalize(df),meta
 
 # ============================================================
 # END DERIV REAL-FOREX LIVE STREAM
