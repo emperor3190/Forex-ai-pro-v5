@@ -3560,12 +3560,21 @@ class DerivRealForexStream:
         return MarketDataEngine.normalize(out).tail(self.outputsize).reset_index(drop=True)
 
     def _subscribe_ticks(self):
+        """Send the minimal documented continuous tick subscription.
+
+        Deliberately sends ONLY the fields required for the tick subscription.
+        Deriv's current documentation shows this exact request shape.
+        Correlation metadata is not needed for the live stream because the
+        response identifies the symbol in tick.symbol.
+        """
         self.status["stage"] = "SUBSCRIBING_LIVE_TICKS"
+        self.status["subscription_request"] = {
+            "ticks": self.deriv_symbol,
+            "subscribe": 1,
+        }
         self._send({
             "ticks": self.deriv_symbol,
             "subscribe": 1,
-            "req_id": 3001,
-            "passthrough": {"v13_stream":"forex_ticks", "symbol":self.deriv_symbol},
         })
 
     def _on_message(self, ws, raw):
@@ -3580,12 +3589,16 @@ class DerivRealForexStream:
             msg="; ".join(str(e.get("message") or e.get("code") or e) for e in errors)
             with self.lock:
                 self.status["error"] = msg or "Deriv returned validation errors"
+                self.status["last_error_code"] = [e.get("code") for e in errors if isinstance(e, dict)]
+                self.status["last_error_request"] = data.get("echo_req")
                 self.status["stage"] = "ERROR"
             return
         if data.get("error"):
             err=data.get("error") or {}
             with self.lock:
                 self.status["error"] = str(err.get("message") or err.get("code") or err)
+                self.status["last_error_code"] = err.get("code")
+                self.status["last_error_request"] = data.get("echo_req")
                 self.status["stage"] = "ERROR"
             return
 
@@ -3672,7 +3685,15 @@ class DerivRealForexStream:
                 self.status.update({
                     "last_tick":ts.isoformat(), "last_quote":quote,
                     "streaming":True, "stage":"LIVE_TICK_RECEIVING",
+                    "first_live_tick_received": True,
+                    "first_live_tick": {
+                        "symbol": tsymbol or self.deriv_symbol,
+                        "quote": quote,
+                        "epoch": epoch,
+                        "timestamp_utc": ts.isoformat(),
+                    },
                     "subscription_id":sub.get("id",self.status.get("subscription_id")),
+                    "error": None,
                 })
                 for tf, seconds in self.TF_SECONDS.items():
                     # Only maintain the timeframe requested by the current V13
