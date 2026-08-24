@@ -775,37 +775,289 @@ class MarketTrackerEngine:
 
 
 class MultiTimeframeEngine:
-    @staticmethod
-    def analyze(df):
-        states = {}
-        for tf in ["M5", "M15", "M30", "H1", "H4", "D1"]:
-            x = MarketDataEngine.resample(df, tf)
-            if len(x) < 220:
-                states[tf] = "INSUFFICIENT"
-            else:
-                states[tf] = TrendEngine.analyze(x)["direction"]
+    """
+    Current-market MTF engine.
 
-        valid = [v for v in states.values() if v != "INSUFFICIENT"]
-        bull = sum(v == "BULLISH" for v in valid)
-        bear = sum(v == "BEARISH" for v in valid)
-        direction = (
-            "BULLISH"
-            if bull > bear and bull >= len(valid) * 0.5
-            else "BEARISH"
-            if bear > bull and bear >= len(valid) * 0.5
-            else "MIXED"
+    Live/dashboard mode:
+      * Fetches each required timeframe directly from the selected live source.
+      * Does NOT try to manufacture H1/H4/D1 from a small M5 window.
+      * D1 is read directly so the current daily market can participate.
+      * Each timeframe is evaluated through the core technical engines.
+      * Data quality is checked independently for every timeframe.
+      * A weak/failed timeframe cannot be silently converted to a bullish/bearish vote.
+
+    Backtest mode:
+      * When no symbol/cfg is supplied, the historical dataframe is resampled,
+        preserving the original backtest behavior.
+    """
+
+    TIMEFRAMES = ("M5", "M15", "M30", "H1", "H4", "D1")
+
+    @staticmethod
+    def _engine_direction(x):
+        """Use several existing technical engines to determine one TF direction."""
+        if x is None or x.empty:
+            return "INSUFFICIENT", {"votes": {}, "agreement": 0.0}
+
+        try:
+            t = TrendEngine.analyze(x)
+            m = MomentumEngine.analyze(x)
+            s = StructureEngine.analyze(x)
+            pa = PriceActionEngine.analyze(x)
+            bo = BreakoutEngine.analyze(x)
+            v = VolatilityEngine.analyze(x)
+            re = RegimeEngine.classify(t, v, s, bo)
+        except Exception as exc:
+            return "ERROR", {"votes": {}, "agreement": 0.0, "error": str(exc)}
+
+        outputs = {
+            "Trend": str(t.get("direction", "")).upper(),
+            "Momentum": str(m.get("direction", "")).upper(),
+            "Structure": str(s.get("direction", "")).upper(),
+            "Price Action": str(pa.get("direction", "")).upper(),
+            "Breakout": str(bo.get("direction", "")).upper(),
+        }
+
+        valid = [v for v in outputs.values() if v in ("BULLISH", "BEARISH")]
+        if not valid:
+            return "NEUTRAL", {
+                "votes": outputs,
+                "agreement": 0.0,
+                "regime": re,
+                "volatility": v.get("regime", "UNKNOWN"),
+            }
+
+        bull = valid.count("BULLISH")
+        bear = valid.count("BEARISH")
+        total = len(valid)
+
+        # Require a real majority. A 2/5 split must not be advertised as alignment.
+        if bull > bear:
+            direction = "BULLISH"
+            agreement = 100.0 * bull / total
+        elif bear > bull:
+            direction = "BEARISH"
+            agreement = 100.0 * bear / total
+        else:
+            direction = "MIXED"
+            agreement = 50.0
+
+        return direction, {
+            "votes": outputs,
+            "agreement": float(agreement),
+            "regime": re,
+            "volatility": v.get("regime", "UNKNOWN"),
+        }
+
+    @staticmethod
+    def _direct_live_data(df, symbol, timeframe, cfg):
+        """
+        Get the exact timeframe needed by MTF.
+
+        The currently loaded dataframe is reused only when its identity exactly
+        matches the requested pair/timeframe/source. Otherwise the live loader
+        fetches that timeframe directly.
+        """
+        requested_source = str(getattr(cfg, "data_source", "")).upper()
+        if (
+            df is not None
+            and not df.empty
+            and canonical_symbol(symbol) == canonical_symbol(
+                st.session_state.get("data_symbol") or symbol
+            )
+            and str(timeframe).upper() == str(
+                st.session_state.get("data_timeframe") or ""
+            ).upper()
+            and str(st.session_state.get("data_source_loaded") or "").upper()
+            == requested_source
+        ):
+            return MarketDataEngine.normalize(df), {
+                "source": requested_source,
+                "direct": True,
+                "reused_selected_dataset": True,
+            }
+
+        # get_live_pair_data is defined later in the module but is available when
+        # this method is called by the running Streamlit application.
+        x, meta = get_live_pair_data(
+            canonical_symbol(symbol), timeframe, cfg, force=False
         )
-        align = 100 * max(bull, bear) / max(len(valid), 1)
+        return MarketDataEngine.normalize(x), dict(meta or {})
+
+    @staticmethod
+    def analyze(df, symbol=None, cfg=None):
+        # ---------------- Historical/backtest compatibility ----------------
+        if symbol is None or cfg is None:
+            states = {}
+            details = {}
+            for tf in MultiTimeframeEngine.TIMEFRAMES:
+                x = MarketDataEngine.resample(df, tf)
+                if len(x) < 100:
+                    states[tf] = "INSUFFICIENT"
+                    details[tf] = {
+                        "status": "INSUFFICIENT",
+                        "rows": int(len(x)),
+                        "source": "HISTORICAL_RESAMPLE",
+                        "current": False,
+                    }
+                    continue
+                direction, info = MultiTimeframeEngine._engine_direction(x)
+                states[tf] = direction
+                details[tf] = {
+                    **info,
+                    "status": "OK",
+                    "rows": int(len(x)),
+                    "source": "HISTORICAL_RESAMPLE",
+                    "current": False,
+                }
+
+            valid = [v for v in states.values() if v in ("BULLISH", "BEARISH")]
+            bull = valid.count("BULLISH")
+            bear = valid.count("BEARISH")
+            direction = (
+                "BULLISH" if bull > bear
+                else "BEARISH" if bear > bull
+                else "MIXED"
+            )
+            align = 100.0 * max(bull, bear) / max(len(valid), 1)
+            return {
+                "states": states,
+                "direction": direction,
+                "alignment": float(align),
+                "strength": (
+                    "VERY STRONG" if align >= 85
+                    else "STRONG" if align >= 70
+                    else "MODERATE" if align >= 55
+                    else "WEAK"
+                ),
+                "details": details,
+                "live_current_market": False,
+            }
+
+        # ---------------- Current/live market mode ----------------
+        states = {}
+        details = {}
+        valid = []
+
+        for tf in MultiTimeframeEngine.TIMEFRAMES:
+            try:
+                x, meta = MultiTimeframeEngine._direct_live_data(
+                    df, symbol, tf, cfg
+                )
+                if x.empty or len(x) < 100:
+                    states[tf] = "INSUFFICIENT"
+                    details[tf] = {
+                        "status": "INSUFFICIENT",
+                        "rows": int(len(x)),
+                        "source": str(meta.get("source", "UNKNOWN")),
+                        "current": tf == "D1",
+                    }
+                    continue
+
+                dq_age = {
+                    "M5": getattr(cfg, "data_max_age_seconds", 420),
+                    "M15": 1200,
+                    "M30": 2400,
+                    "H1": 4800,
+                    "H4": 18000,
+                    # D1 must be current enough to represent today's market.
+                    # This is deliberately tighter than "one calendar day".
+                    "D1": 7200,
+                }.get(tf, getattr(cfg, "data_max_age_seconds", 420))
+
+                dq = DataIntegrityEngine.assess(x, tf, dq_age)
+                direction, info = MultiTimeframeEngine._engine_direction(x)
+
+                # A failed/stale timeframe is never allowed to vote.
+                usable = bool(dq.get("signal_allowed", False)) and direction in (
+                    "BULLISH", "BEARISH"
+                )
+                if usable:
+                    valid.append(direction)
+                    states[tf] = direction
+                    status = "OK"
+                else:
+                    states[tf] = "UNAVAILABLE"
+                    status = "DATA QUALITY BLOCKED"
+
+                last_time = (
+                    str(x["time"].iloc[-1])
+                    if "time" in x.columns and not x.empty
+                    else "-"
+                )
+
+                details[tf] = {
+                    **info,
+                    "status": status,
+                    "rows": int(len(x)),
+                    "source": str(meta.get("source", "UNKNOWN")),
+                    "last_timestamp": last_time,
+                    "age_seconds": float(dq.get("age_seconds", 0.0)),
+                    "data_quality": dq.get("status", "UNKNOWN"),
+                    "data_quality_score": float(dq.get("score", 0.0)),
+                    "current": True,
+                    "usable_vote": usable,
+                }
+            except Exception as exc:
+                states[tf] = "UNAVAILABLE"
+                details[tf] = {
+                    "status": "FETCH/ENGINE ERROR",
+                    "rows": 0,
+                    "source": str(getattr(cfg, "data_source", "UNKNOWN")),
+                    "current": True,
+                    "usable_vote": False,
+                    "error": str(exc),
+                }
+
+        bull = valid.count("BULLISH")
+        bear = valid.count("BEARISH")
+
+        # MTF must have enough independent live timeframes to make a reliable
+        # alignment claim. One valid timeframe must NEVER become "100% aligned".
+        min_valid_timeframes = 3
+        if len(valid) < min_valid_timeframes:
+            direction = "INSUFFICIENT"
+            align = 0.0
+        else:
+            direction = (
+                "BULLISH" if bull > bear
+                else "BEARISH" if bear > bull
+                else "MIXED"
+            )
+            # Coverage is part of the alignment score: unavailable timeframes
+            # count against alignment rather than disappearing from the denominator.
+            align = 100.0 * max(bull, bear) / len(MultiTimeframeEngine.TIMEFRAMES)
+
+        # Explicit D1 status: this tells the user whether today's current
+        # daily market was actually read, rather than inferred from M5.
+        d1 = details.get("D1", {})
+        d1_current = bool(d1.get("usable_vote", False))
+        d1_direction = states.get("D1", "UNAVAILABLE")
+
+        # Current D1 is a mandatory anchor for live MTF. If today's D1 cannot
+        # be read and quality-checked, the system must not pretend to have a
+        # complete daily/intraday alignment.
+        if not d1_current:
+            direction = "INSUFFICIENT"
+            align = 0.0
+
         return {
             "states": states,
-            "direction": direction,
-            "alignment": float(align),
+            "direction": direction if valid else "MIXED",
+            "alignment": float(align if valid else 0.0),
             "strength": (
                 "VERY STRONG" if align >= 85
                 else "STRONG" if align >= 70
                 else "MODERATE" if align >= 55
                 else "WEAK"
             ),
+            "coverage_percent": 100.0 * len(valid) / len(MultiTimeframeEngine.TIMEFRAMES),
+            "details": details,
+            "live_current_market": True,
+            "daily_current_available": d1_current,
+            "daily_current_direction": d1_direction,
+            "usable_timeframes": len(valid),
+            "total_timeframes": len(MultiTimeframeEngine.TIMEFRAMES),
         }
 
 
@@ -2246,7 +2498,8 @@ def analyze_market(df, symbol, cfg, timeframe=None):
     re = RegimeEngine.classify(t, v, s, bo)
     se = SessionEngine.analyze(df.time.iloc[-1])
     cs = CurrencyStrengthEngine.analyze(df, symbol)
-    mtf = MultiTimeframeEngine.analyze(df)
+    # MTF reads every timeframe directly from the selected live source, including current D1.
+    mtf = MultiTimeframeEngine.analyze(df, symbol=symbol, cfg=cfg)
     eco = EconomicEngine.analyze(load_events(), symbol)
     cot = COTEngine.analyze(load_cot(), symbol)
 
@@ -2934,6 +3187,39 @@ def dashboard():
                 "MTF alignment",
                 f"{a['mtf']['alignment']:.0f}% ({a['mtf']['strength']})",
             )
+
+            # Current-market MTF verification: D1 is fetched directly rather
+            # than inferred from the selected intraday candle set.
+            mtf_details = a["mtf"].get("details", {})
+            d1_detail = mtf_details.get("D1", {})
+            if a["mtf"].get("live_current_market"):
+                d1_status = (
+                    "AVAILABLE" if a["mtf"].get("daily_current_available")
+                    else "UNAVAILABLE / BLOCKED"
+                )
+                st.info(
+                    f"CURRENT D1 MARKET: {d1_status} · "
+                    f"Direction: {a['mtf'].get('daily_current_direction','UNAVAILABLE')} · "
+                    f"Quality: {d1_detail.get('data_quality','UNKNOWN')} · "
+                    f"Age: {float(d1_detail.get('age_seconds',0.0)):.0f}s"
+                )
+
+                detail_rows = []
+                for tf in MultiTimeframeEngine.TIMEFRAMES:
+                    d = mtf_details.get(tf, {})
+                    detail_rows.append({
+                        "TF": tf,
+                        "Direction": a["mtf"]["states"].get(tf, "UNAVAILABLE"),
+                        "Data": d.get("data_quality", d.get("status", "UNKNOWN")),
+                        "Age(s)": round(float(d.get("age_seconds", 0.0)), 0),
+                        "Engine agreement": round(float(d.get("agreement", 0.0)), 0),
+                        "Source": d.get("source", "UNKNOWN"),
+                    })
+                st.dataframe(
+                    pd.DataFrame(detail_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
         st.markdown("### Currency Strength")
         cs = a.get("currency_strength") or a.get("cs") or {}
