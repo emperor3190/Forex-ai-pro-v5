@@ -5421,6 +5421,38 @@ def _v14_render_architecture_testing(df, cfg, symbol, timeframe):
             st.dataframe(st.session_state.optimizer, use_container_width=True, hide_index=True)
 
 
+
+def init_state():
+    """Initialize V14 Streamlit session state without changing trading architecture."""
+    defaults = {
+        "data": _empty_market_data(),
+        "data_meta": {},
+        "data_symbol": None,
+        "data_timeframe": None,
+        "data_source_loaded": None,
+        "events": pd.DataFrame(),
+        "cot": pd.DataFrame(),
+        "journal": [],
+        "paper_balance": 10000.0,
+        "td_key": "",
+        "bot_enabled": False,
+        "emergency": False,
+        "live_status": "DISCONNECTED",
+        "v14_backtest": pd.DataFrame(),
+        "v14_backtest_metrics": {},
+        "v14_forward": {},
+        "mc": {},
+        "optimizer": pd.DataFrame(),
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            # Create a fresh mutable object for each missing state key.
+            if isinstance(value, pd.DataFrame):
+                value = value.copy()
+            elif isinstance(value, (dict, list)):
+                value = value.copy()
+            st.session_state[key] = value
+
 def dashboard():
     """
     V14 AI Trading Dashboard.
